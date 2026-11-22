@@ -39,6 +39,9 @@ jobs:
           sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <application|' $M
           sed -i 's|android:label="[^"]*"|android:label="Lyrics Player"|' $M
 
+      - name: Relax Kotlin JVM target check
+        run: printf '\nkotlin.jvm.target.validation.mode=warning\n' >> android/gradle.properties
+
       - run: flutter pub get
 
       - name: Patch on_audio_query for new Gradle
