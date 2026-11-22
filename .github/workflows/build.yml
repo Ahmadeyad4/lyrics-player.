@@ -43,15 +43,21 @@ jobs:
 
       - name: Patch on_audio_query for new Gradle
         run: |
-          for f in $(find $HOME/.pub-cache -path '*on_audio_query_android*/android/build.gradle'); do
-            sed -i 's/jcenter()/mavenCentral()/g' $f
-            sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 35/' $f
-            sed -i 's/VERSION_1_8/VERSION_17/g; s/VERSION_11/VERSION_17/g' $f
-            sed -i "s/jvmTarget *= *'[^']*'/jvmTarget = '17'/g" $f
-            sed -i 's/jvmTarget *= *"[^"]*"/jvmTarget = "17"/g' $f
-            grep -q 'namespace' $f || sed -i '0,/android {/s//android {\n    namespace "com.lucasjosino.on_audio_query"/' $f
-            sed -i 's/package="[^"]*"//' "$(dirname $f)/src/main/AndroidManifest.xml" || true
+          D=$(grep -o 'file://[^"]*on_audio_query_android[^"]*' .dart_tool/package_config.json | head -1 | sed 's|file://||')
+          echo "plugin dir: $D"
+          ls "$D/android"
+          for f in "$D/android/build.gradle" "$D/android/build.gradle.kts"; do
+            [ -f "$f" ] || continue
+            sed -i 's/jcenter()/mavenCentral()/g' "$f"
+            sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 35/' "$f"
+            sed -i 's/VERSION_[0-9_]*/VERSION_17/g' "$f"
+            sed -i "s/jvmTarget *= *'[^']*'/jvmTarget = '17'/g" "$f"
+            sed -i 's/jvmTarget *= *"[^"]*"/jvmTarget = "17"/g' "$f"
+            grep -q 'namespace' "$f" || sed -i '0,/android {/s//android {\n    namespace "com.lucasjosino.on_audio_query"/' "$f"
+            echo "=== $f ==="
+            cat "$f"
           done
+          sed -i 's/package="[^"]*"//' "$D/android/src/main/AndroidManifest.xml" || true
 
       - run: flutter build apk --release
 
