@@ -212,6 +212,171 @@ class App extends StatelessWidget {
   }
 }
 
+class Grp {
+  final String title;
+  final String? sub;
+  final List<SongModel> songs;
+  Grp(this.title, this.sub, this.songs);
+}
+
+String _dirOf(SongModel s) {
+  final i = s.data.lastIndexOf('/');
+  return i <= 0 ? '' : s.data.substring(0, i);
+}
+
+String _lastSeg(String p) {
+  final i = p.lastIndexOf('/');
+  return i < 0 ? p : p.substring(i + 1);
+}
+
+String? _parentSeg(String p) {
+  final i = p.lastIndexOf('/');
+  if (i <= 0) return null;
+  final q = p.substring(0, i).replaceFirst('/storage/emulated/0', '');
+  return q.isEmpty ? '/' : q;
+}
+
+String _artistOf(SongModel s) {
+  final a = cleanArtist(s.artist);
+  return a.isEmpty ? 'فنان غير معروف' : a;
+}
+
+String _albumOf(SongModel s) {
+  final a = s.album;
+  return (a == null || a.isEmpty || a == '<unknown>') ? 'ألبوم غير معروف' : a;
+}
+
+List<Grp> _groupBy(
+  List<SongModel> list,
+  String Function(SongModel) key, {
+  String Function(String)? title,
+  String? Function(String)? sub,
+}) {
+  final m = <String, List<SongModel>>{};
+  for (final s in list) {
+    m.putIfAbsent(key(s), () => []).add(s);
+  }
+  final keys = m.keys.toList()
+    ..sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+  return [
+    for (final k in keys)
+      Grp(title != null ? title(k) : k, sub != null ? sub(k) : null, m[k]!),
+  ];
+}
+
+class SongTile extends StatelessWidget {
+  final SongModel song;
+  final bool hasLyrics;
+  final VoidCallback onTap;
+  const SongTile(
+      {super.key, required this.song, required this.hasLyrics, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final artist = cleanArtist(song.artist);
+    return ListTile(
+      title: Text(song.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+      subtitle: artist.isEmpty
+          ? null
+          : Text(artist,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: muted)),
+      leading: const Icon(Icons.music_note, color: muted),
+      trailing: hasLyrics ? const Icon(Icons.lyrics, color: saffron, size: 20) : null,
+      onTap: onTap,
+    );
+  }
+}
+
+class MiniPlayer extends StatelessWidget {
+  const MiniPlayer({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<SongModel?>(
+      valueListenable: Ctrl.current,
+      builder: (c, s, _) {
+        if (s == null) return const SizedBox.shrink();
+        return Material(
+          color: surface,
+          child: SafeArea(
+            child: ListTile(
+              onTap: () => Navigator.push(
+                  context, MaterialPageRoute(builder: (_) => const PlayerPage())),
+              title: Text(s.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+              trailing: StreamBuilder<bool>(
+                stream: Ctrl.player.playingStream,
+                builder: (c, ps) => IconButton(
+                  icon: Icon(ps.data == true ? Icons.pause : Icons.play_arrow,
+                      color: saffron),
+                  onPressed: () =>
+                      ps.data == true ? Ctrl.player.pause() : Ctrl.player.play(),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// صفحة داخل فنان / ألبوم / مجلد
+class GroupPage extends StatefulWidget {
+  final Grp group;
+  const GroupPage({super.key, required this.group});
+  @override
+  State<GroupPage> createState() => _GroupPageState();
+}
+
+class _GroupPageState extends State<GroupPage> {
+  Set<int> ids = {};
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    final r = await Db.ids();
+    if (mounted) setState(() => ids = r);
+  }
+
+  Future<void> _play(int i) async {
+    Ctrl.play(widget.group.songs, i);
+    await Navigator.push(
+        context, MaterialPageRoute(builder: (_) => const PlayerPage()));
+    _refresh();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final g = widget.group;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(g.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+        actions: [
+          IconButton(
+              tooltip: 'تشغيل الكل',
+              onPressed: () => _play(0),
+              icon: const Icon(Icons.play_circle_fill, color: saffron)),
+        ],
+      ),
+      body: ListView.builder(
+        itemCount: g.songs.length,
+        itemBuilder: (c, i) => SongTile(
+          song: g.songs[i],
+          hasLyrics: ids.contains(g.songs[i].id),
+          onTap: () => _play(i),
+        ),
+      ),
+      bottomNavigationBar: const MiniPlayer(),
+    );
+  }
+}
+
 class Home extends StatefulWidget {
   const Home({super.key});
   @override
@@ -261,9 +426,40 @@ class _HomeState extends State<Home> {
     if (mounted) setState(() => withLyrics = ids);
   }
 
-  void _open() {
-    Navigator.push(context, MaterialPageRoute(builder: (_) => const PlayerPage()))
-        .then((_) => _refreshIds());
+  Future<void> _playFrom(List<SongModel> list, int i) async {
+    Ctrl.play(list, i);
+    await Navigator.push(
+        context, MaterialPageRoute(builder: (_) => const PlayerPage()));
+    _refreshIds();
+  }
+
+  Widget _groupsTab(List<Grp> gs, IconData icon) {
+    if (gs.isEmpty) return const Center(child: Text('ماكو نتائج'));
+    return ListView.builder(
+      itemCount: gs.length,
+      itemBuilder: (c, i) {
+        final g = gs[i];
+        return ListTile(
+          leading: Icon(icon, color: muted),
+          title: Text(g.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('${g.songs.length} أغنية', style: const TextStyle(color: muted)),
+            if (g.sub != null)
+              Text(g.sub!,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textDirection: TextDirection.ltr,
+                  style: const TextStyle(color: muted, fontSize: 12)),
+          ]),
+          trailing: const Icon(Icons.chevron_left, color: muted),
+          onTap: () async {
+            await Navigator.push(
+                context, MaterialPageRoute(builder: (_) => GroupPage(group: g)));
+            _refreshIds();
+          },
+        );
+      },
+    );
   }
 
   @override
@@ -274,7 +470,9 @@ class _HomeState extends State<Home> {
         : songs
             .where((s) =>
                 s.title.toLowerCase().contains(f) ||
-                cleanArtist(s.artist).toLowerCase().contains(f))
+                cleanArtist(s.artist).toLowerCase().contains(f) ||
+                _albumOf(s).toLowerCase().contains(f) ||
+                _lastSeg(_dirOf(s)).toLowerCase().contains(f))
             .toList();
 
     Widget body;
@@ -297,76 +495,63 @@ class _HomeState extends State<Home> {
     } else if (songs.isEmpty) {
       body = const Center(child: Text('ما لقيت أغاني على الهاتف'));
     } else {
-      body = ListView.builder(
-        itemCount: shown.length,
-        itemBuilder: (c, i) {
-          final s = shown[i];
-          final artist = cleanArtist(s.artist);
-          return ListTile(
-            title: Text(s.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-            subtitle: artist.isEmpty
-                ? null
-                : Text(artist,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: muted)),
-            leading: const Icon(Icons.music_note, color: muted),
-            trailing: withLyrics.contains(s.id)
-                ? const Icon(Icons.lyrics, color: saffron, size: 20)
-                : null,
-            onTap: () {
-              Ctrl.play(shown, i);
-              _open();
-            },
-          );
-        },
-      );
+      body = TabBarView(children: [
+        shown.isEmpty
+            ? const Center(child: Text('ماكو نتائج'))
+            : ListView.builder(
+                itemCount: shown.length,
+                itemBuilder: (c, i) => SongTile(
+                  song: shown[i],
+                  hasLyrics: withLyrics.contains(shown[i].id),
+                  onTap: () => _playFrom(shown, i),
+                ),
+              ),
+        _groupsTab(_groupBy(shown, _artistOf), Icons.person),
+        _groupsTab(_groupBy(shown, _albumOf), Icons.album),
+        _groupsTab(
+          _groupBy(shown, _dirOf, title: _lastSeg, sub: _parentSeg),
+          Icons.folder,
+        ),
+      ]);
     }
 
-    return Scaffold(
-      appBar: AppBar(title: const Text('الأغاني')),
-      body: Column(children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-          child: TextField(
-            onChanged: (v) => setState(() => filter = v),
-            decoration: InputDecoration(
-              hintText: 'ابحث باسم الأغنية أو الفنان',
-              prefixIcon: const Icon(Icons.search),
-              filled: true,
-              fillColor: surface,
-              border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(28),
-                borderSide: BorderSide.none,
-              ),
-            ),
+    return DefaultTabController(
+      length: 4,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('مشغل الكلمات'),
+          bottom: const TabBar(
+            indicatorColor: saffron,
+            labelColor: saffron,
+            unselectedLabelColor: muted,
+            tabs: [
+              Tab(text: 'الأغاني'),
+              Tab(text: 'الفنانين'),
+              Tab(text: 'الألبومات'),
+              Tab(text: 'المجلدات'),
+            ],
           ),
         ),
-        Expanded(child: body),
-      ]),
-      bottomNavigationBar: ValueListenableBuilder<SongModel?>(
-        valueListenable: Ctrl.current,
-        builder: (c, s, _) {
-          if (s == null) return const SizedBox.shrink();
-          return Material(
-            color: surface,
-            child: SafeArea(
-              child: ListTile(
-                onTap: _open,
-                title: Text(s.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-                trailing: StreamBuilder<bool>(
-                  stream: Ctrl.player.playingStream,
-                  builder: (c, ps) => IconButton(
-                    icon: Icon(ps.data == true ? Icons.pause : Icons.play_arrow,
-                        color: saffron),
-                    onPressed: () =>
-                        ps.data == true ? Ctrl.player.pause() : Ctrl.player.play(),
-                  ),
+        body: Column(children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+            child: TextField(
+              onChanged: (v) => setState(() => filter = v),
+              decoration: InputDecoration(
+                hintText: 'ابحث باسم الأغنية أو الفنان أو الألبوم',
+                prefixIcon: const Icon(Icons.search),
+                filled: true,
+                fillColor: surface,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(28),
+                  borderSide: BorderSide.none,
                 ),
               ),
             ),
-          );
-        },
+          ),
+          Expanded(child: body),
+        ]),
+        bottomNavigationBar: const MiniPlayer(),
       ),
     );
   }
