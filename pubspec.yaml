@@ -9,7 +9,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  just_audio: ^0.9.40
+  just_audio: ">=0.9.40 <0.11.0"
+  just_audio_background: ^0.0.1-beta.11
+  file_picker: ^8.1.2
   on_audio_query: ^2.9.0
   permission_handler: ^11.3.1
   sqflite: ^2.3.3
