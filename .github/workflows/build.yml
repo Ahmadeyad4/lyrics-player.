@@ -46,6 +46,9 @@ jobs:
           for f in $(find $HOME/.pub-cache -path '*on_audio_query_android*/android/build.gradle'); do
             sed -i 's/jcenter()/mavenCentral()/g' $f
             sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 35/' $f
+            sed -i 's/VERSION_1_8/VERSION_17/g; s/VERSION_11/VERSION_17/g' $f
+            sed -i "s/jvmTarget *= *'[^']*'/jvmTarget = '17'/g" $f
+            sed -i 's/jvmTarget *= *"[^"]*"/jvmTarget = "17"/g' $f
             grep -q 'namespace' $f || sed -i '0,/android {/s//android {\n    namespace "com.lucasjosino.on_audio_query"/' $f
             sed -i 's/package="[^"]*"//' "$(dirname $f)/src/main/AndroidManifest.xml" || true
           done
