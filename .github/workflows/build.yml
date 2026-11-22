@@ -75,6 +75,16 @@ jobs:
           done
           sed -i 's/package="[^"]*"//' "$D/android/src/main/AndroidManifest.xml" || true
 
+      - name: Raise compileSdk for all plugins
+        run: |
+          for D in $(grep -o 'file://[^"]*' .dart_tool/package_config.json | sed 's|file://||'); do
+            for f in "$D/android/build.gradle" "$D/android/build.gradle.kts"; do
+              [ -f "$f" ] || continue
+              perl -pi -e 's/(compileSdk(?:Version)?[ =(]+)\d+/${1}36/' "$f"
+              echo "patched: $f"
+            done
+          done
+
       - run: flutter build apk --release
 
       - uses: actions/upload-artifact@v4
