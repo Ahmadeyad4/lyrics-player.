@@ -33,14 +33,27 @@ jobs:
           cp -r /tmp/lib_bak lib
           cp /tmp/pubspec_bak.yaml pubspec.yaml
 
-      - name: Android permissions and app name
+      - name: Android permissions, audio service and app name
         run: |
           M=android/app/src/main/AndroidManifest.xml
-          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <application|' $M
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <application|' $M
+          sed -i 's|</application>|<service android:name="com.ryanheise.audioservice.AudioService" android:foregroundServiceType="mediaPlayback" android:exported="true"><intent-filter><action android:name="android.media.browse.MediaBrowserService"/></intent-filter></service>\n        <receiver android:name="com.ryanheise.audioservice.MediaButtonReceiver" android:exported="true"><intent-filter><action android:name="android.intent.action.MEDIA_BUTTON"/></intent-filter></receiver>\n    </application>|' $M
           sed -i 's|android:label="[^"]*"|android:label="Lyrics Player"|' $M
+          cat $M
+
+      - name: Use AudioServiceActivity
+        run: |
+          F=$(find android/app/src/main -name 'MainActivity.*' | head -1)
+          sed -i 's|io.flutter.embedding.android.FlutterActivity|com.ryanheise.audioservice.AudioServiceActivity|; s|FlutterActivity()|AudioServiceActivity()|' "$F"
+          cat "$F"
 
       - name: Relax Kotlin JVM target check
         run: printf '\nkotlin.jvm.target.validation.mode=warning\n' >> android/gradle.properties
+
+      - name: Use fixed signing key
+        run: |
+          mkdir -p $HOME/.android
+          cp debug.keystore $HOME/.android/debug.keystore
 
       - run: flutter pub get
 
