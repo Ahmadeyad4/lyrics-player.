@@ -59,11 +59,20 @@ class Lyrics {
 class Db {
   static Database? _db;
 
+  static const _trSql =
+      'CREATE TABLE IF NOT EXISTS translations(song_id INTEGER PRIMARY KEY, body TEXT NOT NULL)';
+
   static Future<Database> get _d async => _db ??= await openDatabase(
         p.join(await getDatabasesPath(), 'lyrics.db'),
-        version: 1,
-        onCreate: (d, v) => d.execute(
-            'CREATE TABLE lyrics(song_id INTEGER PRIMARY KEY, body TEXT NOT NULL)'),
+        version: 2,
+        onCreate: (d, v) async {
+          await d.execute(
+              'CREATE TABLE lyrics(song_id INTEGER PRIMARY KEY, body TEXT NOT NULL)');
+          await d.execute(_trSql);
+        },
+        onUpgrade: (d, o, n) async {
+          if (o < 2) await d.execute(_trSql);
+        },
       );
 
   static Future<String?> get(int id) async {
@@ -71,13 +80,32 @@ class Db {
     return r.isEmpty ? null : r.first['body'] as String;
   }
 
+  /// حفظ الكلمات (وأي ترجمة قديمة تنحذف لأن الأسطر تغيّرت)
   static Future<void> save(int id, String body) async {
-    await (await _d).insert('lyrics', {'song_id': id, 'body': body},
+    final d = await _d;
+    await d.insert('lyrics', {'song_id': id, 'body': body},
         conflictAlgorithm: ConflictAlgorithm.replace);
+    await d.delete('translations', where: 'song_id=?', whereArgs: [id]);
   }
 
   static Future<void> delete(int id) async {
-    await (await _d).delete('lyrics', where: 'song_id=?', whereArgs: [id]);
+    final d = await _d;
+    await d.delete('lyrics', where: 'song_id=?', whereArgs: [id]);
+    await d.delete('translations', where: 'song_id=?', whereArgs: [id]);
+  }
+
+  static Future<List<String>?> getTr(int id) async {
+    final r = await (await _d)
+        .query('translations', where: 'song_id=?', whereArgs: [id]);
+    if (r.isEmpty) return null;
+    return (jsonDecode(r.first['body'] as String) as List)
+        .map((e) => e.toString())
+        .toList();
+  }
+
+  static Future<void> saveTr(int id, List<String> t) async {
+    await (await _d).insert('translations', {'song_id': id, 'body': jsonEncode(t)},
+        conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
   static Future<Map<int, String>> all() async {
@@ -133,6 +161,56 @@ class LrcLib {
       if (plain != null) return plain;
     }
     return null;
+  }
+}
+
+/// ترجمة سطر بسطر للإنكليزي (تحتاج إنترنت، وتنحفظ بالهاتف بعدها)
+class Translator {
+  static final _arabic = RegExp(r'[\u0600-\u06FF]');
+
+  static Future<String> _one(String text) async {
+    Object? last;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        final r = await http.get(
+          Uri.https('translate.googleapis.com', '/translate_a/single', {
+            'client': 'gtx',
+            'sl': 'auto',
+            'tl': 'en',
+            'dt': 't',
+            'q': text,
+          }),
+          headers: {'User-Agent': 'Mozilla/5.0'},
+        ).timeout(const Duration(seconds: 15));
+        if (r.statusCode != 200) throw Exception('http ${r.statusCode}');
+        final j = jsonDecode(utf8.decode(r.bodyBytes)) as List;
+        return (j[0] as List)
+            .map((e) => ((e as List)[0] ?? '').toString())
+            .join()
+            .trim();
+      } catch (e) {
+        last = e;
+      }
+    }
+    throw last ?? Exception('translate failed');
+  }
+
+  /// يترجم الأسطر اللي فيها حروف عربية فقط، ويرجع قائمة بنفس الطول
+  static Future<List<String>> lines(List<String> src) async {
+    final out = List<String>.filled(src.length, '');
+    final todo = [
+      for (var i = 0; i < src.length; i++)
+        if (_arabic.hasMatch(src[i])) i
+    ];
+    for (var k = 0; k < todo.length; k += 6) {
+      final end = k + 6 > todo.length ? todo.length : k + 6;
+      final chunk = todo.sublist(k, end);
+      final res = await Future.wait(chunk.map((i) => _one(src[i])));
+      for (var j = 0; j < chunk.length; j++) {
+        out[chunk[j]] = res[j];
+      }
+    }
+    return out;
   }
 }
 
@@ -778,6 +856,9 @@ class _LyricsViewState extends State<LyricsView> {
   bool loading = true;
   int active = -1;
   int offsetMs = 0;
+  List<String>? tr;
+  bool showTr = true;
+  bool translating = false;
   final sc = ItemScrollController();
   StreamSubscription<Duration>? sub;
 
@@ -796,12 +877,50 @@ class _LyricsViewState extends State<LyricsView> {
 
   Future<void> _load() async {
     final raw = await Db.get(widget.song.id);
+    final l = raw == null ? null : Lyrics.parse(raw);
+    var t = raw == null ? null : await Db.getTr(widget.song.id);
+    if (l != null && t != null && t.length != l.length) t = null;
     if (!mounted) return;
     setState(() {
-      lyrics = raw == null ? null : Lyrics.parse(raw);
+      lyrics = l;
+      tr = t;
       loading = false;
       active = -1;
     });
+  }
+
+  Future<void> _translate() async {
+    final l = lyrics;
+    if (l == null || translating) return;
+    setState(() => translating = true);
+    final msg = ScaffoldMessenger.of(context);
+    msg.showSnackBar(const SnackBar(
+        content: Text('جاري الترجمة...'), duration: Duration(seconds: 60)));
+    try {
+      final src = l.synced
+          ? l.lines.map((e) => e.text).toList()
+          : List<String>.from(l.plain);
+      final t = await Translator.lines(src);
+      msg.hideCurrentSnackBar();
+      if (t.every((e) => e.isEmpty)) {
+        msg.showSnackBar(
+            const SnackBar(content: Text('ماكو سطور عربية تحتاج ترجمة')));
+      } else {
+        await Db.saveTr(widget.song.id, t);
+        if (mounted) {
+          setState(() {
+            tr = t;
+            showTr = true;
+          });
+        }
+      }
+    } catch (_) {
+      msg.hideCurrentSnackBar();
+      msg.showSnackBar(const SnackBar(
+          content: Text('تعذّرت الترجمة. تأكد من الإنترنت وجرّب مرة ثانية.')));
+    } finally {
+      if (mounted) setState(() => translating = false);
+    }
   }
 
   void _onPos(Duration pos) {
@@ -855,24 +974,42 @@ class _LyricsViewState extends State<LyricsView> {
     final raw = l.synced ? l.lines[i].text : l.plain[i];
     final text = raw.isEmpty ? (l.synced ? '♪' : ' ') : raw;
     final on = l.synced && i == active;
+    final t = (showTr && tr != null && i < tr!.length) ? tr![i] : '';
     return InkWell(
       onTap: l.synced ? () => _seekTo(l.lines[i]) : null,
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 9, horizontal: 24),
-        child: Directionality(
-          textDirection: _isArabic(text) ? TextDirection.rtl : TextDirection.ltr,
-          child: AnimatedDefaultTextStyle(
-            duration: const Duration(milliseconds: 250),
-            style: TextStyle(
-              fontSize: on ? 27 : 20,
-              height: 1.45,
-              fontWeight: on ? FontWeight.w700 : FontWeight.w400,
-              color: on ? saffron : (l.synced ? muted : paper),
+        child: Column(children: [
+          Directionality(
+            textDirection: _isArabic(text) ? TextDirection.rtl : TextDirection.ltr,
+            child: AnimatedDefaultTextStyle(
+              duration: const Duration(milliseconds: 250),
+              style: TextStyle(
+                fontSize: on ? 27 : 20,
+                height: 1.45,
+                fontWeight: on ? FontWeight.w700 : FontWeight.w400,
+                color: on ? saffron : (l.synced ? muted : paper),
+              ),
+              textAlign: TextAlign.center,
+              child: Text(text, textAlign: TextAlign.center),
             ),
-            textAlign: TextAlign.center,
-            child: Text(text, textAlign: TextAlign.center),
           ),
-        ),
+          if (t.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                t,
+                textDirection: TextDirection.ltr,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: on ? 17 : 15,
+                  height: 1.35,
+                  fontStyle: FontStyle.italic,
+                  color: on ? paper : muted.withOpacity(0.8),
+                ),
+              ),
+            ),
+        ]),
       ),
     );
   }
@@ -922,9 +1059,29 @@ class _LyricsViewState extends State<LyricsView> {
                 tooltip: 'سحب من الإنترنت',
                 onPressed: _fetch,
                 icon: const Icon(Icons.cloud_download)),
+            IconButton(
+              tooltip: tr == null
+                  ? 'ترجمة للإنكليزي'
+                  : (showTr ? 'إخفاء الترجمة' : 'إظهار الترجمة'),
+              onPressed: translating
+                  ? null
+                  : () {
+                      if (tr == null) {
+                        _translate();
+                      } else {
+                        setState(() => showTr = !showTr);
+                      }
+                    },
+              icon: translating
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : Icon(Icons.translate,
+                      color: (tr != null && showTr) ? saffron : null),
+            ),
             const Spacer(),
             if (lyrics!.synced) ...[
-              const Text('ضبط التوقيت', style: TextStyle(color: muted, fontSize: 13)),
               IconButton(
                   onPressed: () => setState(() => offsetMs -= 500),
                   icon: const Icon(Icons.remove_circle_outline)),
