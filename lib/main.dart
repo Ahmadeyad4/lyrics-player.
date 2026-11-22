@@ -1,9 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart';
+import 'package:just_audio_background/just_audio_background.dart';
 import 'package:on_audio_query/on_audio_query.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
@@ -75,6 +78,11 @@ class Db {
 
   static Future<void> delete(int id) async {
     await (await _d).delete('lyrics', where: 'song_id=?', whereArgs: [id]);
+  }
+
+  static Future<Map<int, String>> all() async {
+    final r = await (await _d).query('lyrics');
+    return {for (final e in r) e['song_id'] as int: e['body'] as String};
   }
 
   static Future<Set<int>> ids() async {
@@ -150,7 +158,17 @@ class Ctrl {
     final s = q[i];
     current.value = s;
     final uri = s.uri != null ? Uri.parse(s.uri!) : Uri.file(s.data);
-    await player.setAudioSource(AudioSource.uri(uri));
+    final artist = cleanArtist(s.artist);
+    await player.setAudioSource(AudioSource.uri(
+      uri,
+      tag: MediaItem(
+        id: '${s.id}',
+        title: s.title,
+        artist: artist.isEmpty ? null : artist,
+        album: s.album,
+        duration: s.duration != null ? Duration(milliseconds: s.duration!) : null,
+      ),
+    ));
     player.play();
   }
 
@@ -171,8 +189,13 @@ const saffron = Color(0xFFF2B84B);
 const paper = Color(0xFFF3ECE2);
 const muted = Color(0xFF9B8FAE);
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await JustAudioBackground.init(
+    androidNotificationChannelId: 'com.lyricplayer.audio',
+    androidNotificationChannelName: 'تشغيل الموسيقى',
+    androidNotificationOngoing: true,
+  );
   Ctrl.init();
   runApp(const App());
 }
@@ -410,6 +433,7 @@ class _HomeState extends State<Home> {
       });
       return;
     }
+    await Permission.notification.request();
     final all = await _q.querySongs(
       sortType: SongSortType.TITLE,
       orderType: OrderType.ASC_OR_SMALLER,
@@ -431,6 +455,96 @@ class _HomeState extends State<Home> {
     await Navigator.push(
         context, MaterialPageRoute(builder: (_) => const PlayerPage()));
     _refreshIds();
+  }
+
+  void _toast(String t) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+  }
+
+  Future<void> _export() async {
+    final all = await Db.all();
+    if (all.isEmpty) {
+      _toast('ماكو كلمات محفوظة للتصدير');
+      return;
+    }
+    final byId = {for (final s in songs) s.id: s};
+    final items = <Map<String, dynamic>>[];
+    for (final e in all.entries) {
+      final s = byId[e.key];
+      items.add({
+        'id': e.key,
+        'title': s?.title ?? '',
+        'artist': cleanArtist(s?.artist),
+        'album': s?.album ?? '',
+        'duration': s?.duration ?? 0,
+        'lrc': e.value,
+      });
+    }
+    final text = jsonEncode({'app': 'lyrics_player', 'version': 1, 'items': items});
+    try {
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: 'حفظ نسخة الكلمات الاحتياطية',
+        fileName: 'lyrics_backup.json',
+        bytes: Uint8List.fromList(utf8.encode(text)),
+      );
+      if (path != null) _toast('تم تصدير ${items.length} من الكلمات');
+    } catch (_) {
+      _toast('تعذّر حفظ الملف');
+    }
+  }
+
+  Future<void> _import() async {
+    try {
+      final r = await FilePicker.platform
+          .pickFiles(type: FileType.any, withData: true);
+      if (r == null || r.files.isEmpty) return;
+      final bytes = r.files.first.bytes;
+      if (bytes == null) {
+        _toast('تعذّر قراءة الملف');
+        return;
+      }
+      final data = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
+      final items = (data['items'] as List).cast<Map<String, dynamic>>();
+
+      String norm(String? x) => (x ?? '').trim().toLowerCase();
+      final byKey = <String, SongModel>{};
+      final byTitle = <String, List<SongModel>>{};
+      for (final s in songs) {
+        byKey['${norm(s.title)}|${norm(cleanArtist(s.artist))}'] = s;
+        byTitle.putIfAbsent(norm(s.title), () => []).add(s);
+      }
+      final byId = {for (final s in songs) s.id: s};
+
+      var ok = 0, skipped = 0;
+      for (final it in items) {
+        final lrc = (it['lrc'] as String?) ?? '';
+        if (lrc.trim().isEmpty) continue;
+        final title = norm(it['title'] as String?);
+        final artist = norm(it['artist'] as String?);
+        SongModel? target = byKey['$title|$artist'];
+        if (target == null && title.isNotEmpty) {
+          final c = byTitle[title];
+          if (c != null && c.length == 1) target = c.first;
+        }
+        if (target == null && title.isEmpty) {
+          final id = it['id'];
+          if (id is int) target = byId[id];
+        }
+        if (target == null) {
+          skipped++;
+          continue;
+        }
+        await Db.save(target.id, lrc);
+        ok++;
+      }
+      await _refreshIds();
+      var msg = 'تم استيراد $ok من الكلمات';
+      if (skipped > 0) msg += ' (تخطّيت $skipped لأن الأغنية غير موجودة)';
+      _toast(msg);
+    } catch (_) {
+      _toast('الملف غير صالح');
+    }
   }
 
   Widget _groupsTab(List<Grp> gs, IconData icon) {
@@ -520,6 +634,21 @@ class _HomeState extends State<Home> {
       child: Scaffold(
         appBar: AppBar(
           title: const Text('مشغل الكلمات'),
+          actions: [
+            PopupMenuButton<String>(
+              onSelected: (v) {
+                if (v == 'export') {
+                  _export();
+                } else {
+                  _import();
+                }
+              },
+              itemBuilder: (c) => const [
+                PopupMenuItem(value: 'export', child: Text('تصدير الكلمات (نسخة احتياطية)')),
+                PopupMenuItem(value: 'import', child: Text('استيراد الكلمات')),
+              ],
+            ),
+          ],
           bottom: const TabBar(
             indicatorColor: saffron,
             labelColor: saffron,
