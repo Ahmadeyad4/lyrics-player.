@@ -1,9 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' show Random;
 import 'dart:typed_data';
+import 'dart:ui' show ImageFilter;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
@@ -59,21 +62,103 @@ class Lyrics {
 class Db {
   static Database? _db;
 
-  static const _trSql =
-      'CREATE TABLE IF NOT EXISTS translations(song_id INTEGER PRIMARY KEY, body TEXT NOT NULL)';
+  static const _tables = [
+    'CREATE TABLE IF NOT EXISTS lyrics(song_id INTEGER PRIMARY KEY, body TEXT NOT NULL)',
+    'CREATE TABLE IF NOT EXISTS translations(song_id INTEGER PRIMARY KEY, body TEXT NOT NULL)',
+    'CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL)',
+    'CREATE TABLE IF NOT EXISTS favorites(song_id INTEGER PRIMARY KEY)',
+    'CREATE TABLE IF NOT EXISTS playlists(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)',
+    'CREATE TABLE IF NOT EXISTS playlist_songs(playlist_id INTEGER NOT NULL, song_id INTEGER NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY(playlist_id, song_id))',
+  ];
+
+  static Future<void> _create(Database d) async {
+    for (final q in _tables) {
+      await d.execute(q);
+    }
+  }
 
   static Future<Database> get _d async => _db ??= await openDatabase(
         p.join(await getDatabasesPath(), 'lyrics.db'),
-        version: 2,
-        onCreate: (d, v) async {
-          await d.execute(
-              'CREATE TABLE lyrics(song_id INTEGER PRIMARY KEY, body TEXT NOT NULL)');
-          await d.execute(_trSql);
-        },
+        version: 4,
+        onCreate: (d, v) => _create(d),
         onUpgrade: (d, o, n) async {
-          if (o < 2) await d.execute(_trSql);
+          await _create(d);
+          // الترجمة صارت من الإنكليزي للعربي، فنمسح القديمة
+          if (o < 3) await d.execute('DELETE FROM translations');
         },
       );
+
+  // ---- إعدادات بسيطة (مفتاح/قيمة) ----
+  static Future<String?> getKv(String k) async {
+    final r = await (await _d).query('kv', where: 'k=?', whereArgs: [k]);
+    return r.isEmpty ? null : r.first['v'] as String;
+  }
+
+  static Future<void> setKv(String k, String v) async {
+    await (await _d).insert('kv', {'k': k, 'v': v},
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  // ---- المفضلة ----
+  static Future<Set<int>> favs() async {
+    final r = await (await _d).query('favorites');
+    return r.map((e) => e['song_id'] as int).toSet();
+  }
+
+  static Future<void> setFav(int id, bool on) async {
+    final d = await _d;
+    if (on) {
+      await d.insert('favorites', {'song_id': id},
+          conflictAlgorithm: ConflictAlgorithm.ignore);
+    } else {
+      await d.delete('favorites', where: 'song_id=?', whereArgs: [id]);
+    }
+  }
+
+  // ---- قوائم التشغيل ----
+  static Future<List<Map<String, Object?>>> playlists() async {
+    return (await _d).rawQuery(
+        'SELECT p.id AS id, p.name AS name, '
+        '(SELECT COUNT(*) FROM playlist_songs s WHERE s.playlist_id = p.id) AS n '
+        'FROM playlists p ORDER BY p.id');
+  }
+
+  static Future<int> newPlaylist(String name) async =>
+      (await _d).insert('playlists', {'name': name});
+
+  static Future<void> renamePlaylist(int id, String name) async {
+    await (await _d)
+        .update('playlists', {'name': name}, where: 'id=?', whereArgs: [id]);
+  }
+
+  static Future<void> deletePlaylist(int id) async {
+    final d = await _d;
+    await d.delete('playlist_songs', where: 'playlist_id=?', whereArgs: [id]);
+    await d.delete('playlists', where: 'id=?', whereArgs: [id]);
+  }
+
+  static Future<List<int>> playlistSongIds(int pid) async {
+    final r = await (await _d).query('playlist_songs',
+        where: 'playlist_id=?', whereArgs: [pid], orderBy: 'pos');
+    return r.map((e) => e['song_id'] as int).toList();
+  }
+
+  static Future<void> addToPlaylist(int pid, int songId) async {
+    await (await _d).rawInsert(
+        'INSERT OR IGNORE INTO playlist_songs(playlist_id, song_id, pos) '
+        'VALUES(?, ?, (SELECT COALESCE(MAX(pos), 0) + 1 FROM playlist_songs WHERE playlist_id = ?))',
+        [pid, songId, pid]);
+  }
+
+  static Future<void> removeFromPlaylist(int pid, int songId) async {
+    await (await _d).delete('playlist_songs',
+        where: 'playlist_id=? AND song_id=?', whereArgs: [pid, songId]);
+  }
+
+  static Future<Map<int, String>> allTr() async {
+    final r = await (await _d).query('translations');
+    return {for (final e in r) e['song_id'] as int: e['body'] as String};
+  }
 
   static Future<String?> get(int id) async {
     final r = await (await _d).query('lyrics', where: 'song_id=?', whereArgs: [id]);
@@ -164,9 +249,10 @@ class LrcLib {
   }
 }
 
-/// ترجمة سطر بسطر للإنكليزي (تحتاج إنترنت، وتنحفظ بالهاتف بعدها)
+/// ترجمة سطر بسطر من الإنكليزي للعربي (تحتاج إنترنت، وتنحفظ بالهاتف بعدها)
 class Translator {
   static final _arabic = RegExp(r'[\u0600-\u06FF]');
+  static final _latin = RegExp(r'[A-Za-z]');
 
   static Future<String> _one(String text) async {
     Object? last;
@@ -176,7 +262,7 @@ class Translator {
           Uri.https('translate.googleapis.com', '/translate_a/single', {
             'client': 'gtx',
             'sl': 'auto',
-            'tl': 'en',
+            'tl': 'ar',
             'dt': 't',
             'q': text,
           }),
@@ -195,12 +281,12 @@ class Translator {
     throw last ?? Exception('translate failed');
   }
 
-  /// يترجم الأسطر اللي فيها حروف عربية فقط، ويرجع قائمة بنفس الطول
+  /// يترجم الأسطر الإنكليزية فقط (الأسطر العربية تبقى بدون ترجمة)، ويرجع قائمة بنفس الطول
   static Future<List<String>> lines(List<String> src) async {
     final out = List<String>.filled(src.length, '');
     final todo = [
       for (var i = 0; i < src.length; i++)
-        if (_arabic.hasMatch(src[i])) i
+        if (_latin.hasMatch(src[i]) && !_arabic.hasMatch(src[i])) i
     ];
     for (var k = 0; k < todo.length; k += 6) {
       final end = k + 6 > todo.length ? todo.length : k + 6;
@@ -220,45 +306,232 @@ String cleanArtist(String? a) => (a == null || a == '<unknown>') ? '' : a;
 class Ctrl {
   static final player = AudioPlayer();
   static List<SongModel> queue = [];
+  static String queueName = 'كل الأغاني';
   static final current = ValueNotifier<SongModel?>(null);
+
+  /// تشغيل عشوائي
+  static final shuffle = ValueNotifier<bool>(false);
+
+  /// 0 = بدون تكرار (يوقف بنهاية القائمة)، 1 = تكرار القائمة، 2 = تكرار الأغنية
+  static final repeat = ValueNotifier<int>(1);
+
+  static final fontScale = ValueNotifier<double>(1.0);
+  static final speed = ValueNotifier<double>(1.0);
+  static final sleepEnd = ValueNotifier<DateTime?>(null);
+  static final sleepAfterSong = ValueNotifier<bool>(false);
+  static Timer? _sleepTimer;
+
+  static final List<int> _history = [];
+  static final Set<int> _played = {};
+  static final _rand = Random();
+  static DateTime _lastSave = DateTime.fromMillisecondsSinceEpoch(0);
   static bool _inited = false;
+
+  static Future<void> loadPrefs() async {
+    shuffle.value = (await Db.getKv('shuffle')) == '1';
+    repeat.value = int.tryParse(await Db.getKv('repeat') ?? '') ?? 1;
+    fontScale.value = double.tryParse(await Db.getKv('font_scale') ?? '') ?? 1.0;
+  }
 
   static void init() {
     if (_inited) return;
     _inited = true;
-    player.processingStateStream.listen((s) {
-      if (s == ProcessingState.completed) next();
+    player.processingStateStream.listen((st) {
+      if (st != ProcessingState.completed) return;
+      if (sleepAfterSong.value) {
+        sleepAfterSong.value = false;
+        _stopAtEnd();
+        return;
+      }
+      if (repeat.value == 2) {
+        player.seek(Duration.zero);
+        player.play();
+      } else {
+        next(auto: true);
+      }
     });
+    player.playingStream.listen((p) {
+      if (!p) _savePos(player.position);
+    });
+    player.positionStream.listen((pos) {
+      if (!player.playing) return;
+      final now = DateTime.now();
+      if (now.difference(_lastSave) > const Duration(seconds: 5)) {
+        _lastSave = now;
+        _savePos(pos);
+      }
+    });
+    shuffle.addListener(() => Db.setKv('shuffle', shuffle.value ? '1' : '0'));
+    repeat.addListener(() => Db.setKv('repeat', '${repeat.value}'));
+    fontScale.addListener(
+        () => Db.setKv('font_scale', fontScale.value.toStringAsFixed(2)));
   }
 
-  static Future<void> play(List<SongModel> q, int i) async {
+  static void _savePos(Duration p) {
+    if (current.value == null) return;
+    Db.setKv('last_pos', '${p.inMilliseconds}');
+  }
+
+  static void _saveQueue() {
+    final c = current.value;
+    if (c == null) return;
+    Db.setKv('last_id', '${c.id}');
+    Db.setKv('last_queue', queue.map((e) => e.id).join(','));
+    Db.setKv('last_qname', queueName);
+    Db.setKv('last_pos', '0');
+  }
+
+  /// يرجّع آخر أغنية ومكانها (بدون تشغيل تلقائي)
+  static Future<void> restore(List<SongModel> all) async {
+    if (current.value != null) return;
+    final id = int.tryParse(await Db.getKv('last_id') ?? '');
+    if (id == null) return;
+    final byId = {for (final s in all) s.id: s};
+    final s = byId[id];
+    if (s == null) return;
+    final csv = await Db.getKv('last_queue') ?? '';
+    var q = <SongModel>[];
+    for (final part in csv.split(',')) {
+      final x = int.tryParse(part);
+      final song = x == null ? null : byId[x];
+      if (song != null) q.add(song);
+    }
+    if (!q.any((e) => e.id == id)) q = all;
     queue = q;
-    final s = q[i];
+    queueName = await Db.getKv('last_qname') ?? 'كل الأغاني';
+    final pos = int.tryParse(await Db.getKv('last_pos') ?? '') ?? 0;
+    try {
+      await _open(s, at: Duration(milliseconds: pos), autoplay: false);
+    } catch (_) {}
+  }
+
+  static int _indexOf(SongModel s) => queue.indexWhere((e) => e.id == s.id);
+
+  /// تشغيل أغنية من قائمة. name = اسم الفنان/الألبوم/المجلد (للعرض)
+  static Future<void> play(List<SongModel> q, int i, {String? name}) async {
+    queue = q;
+    queueName = name ?? 'كل الأغاني';
+    _history.clear();
+    _played.clear();
+    await _start(i);
+  }
+
+  static Future<void> _open(SongModel s,
+      {Duration? at, required bool autoplay}) async {
+    _played.add(s.id);
     current.value = s;
     final uri = s.uri != null ? Uri.parse(s.uri!) : Uri.file(s.data);
     final artist = cleanArtist(s.artist);
-    await player.setAudioSource(AudioSource.uri(
-      uri,
-      tag: MediaItem(
-        id: '${s.id}',
-        title: s.title,
-        artist: artist.isEmpty ? null : artist,
-        album: s.album,
-        duration: s.duration != null ? Duration(milliseconds: s.duration!) : null,
+    await player.setAudioSource(
+      AudioSource.uri(
+        uri,
+        tag: MediaItem(
+          id: '${s.id}',
+          title: s.title,
+          artist: artist.isEmpty ? null : artist,
+          album: s.album,
+          duration: s.duration != null ? Duration(milliseconds: s.duration!) : null,
+        ),
       ),
-    ));
-    player.play();
+      initialPosition: at,
+    );
+    if (autoplay) player.play();
   }
 
-  static Future<void> _step(int d) async {
+  static Future<void> _start(int i) async {
+    await _open(queue[i], autoplay: true);
+    _saveQueue();
+  }
+
+  static Future<void> _stopAtEnd() async {
+    await player.pause();
+    await player.seek(Duration.zero);
+  }
+
+  static Future<void> next({bool auto = false}) async {
     final c = current.value;
     if (c == null || queue.isEmpty) return;
-    final i = queue.indexWhere((e) => e.id == c.id);
-    await play(queue, (i + d + queue.length) % queue.length);
+    final i = _indexOf(c);
+    int n;
+    if (shuffle.value && queue.length > 1) {
+      var left = [
+        for (var k = 0; k < queue.length; k++)
+          if (!_played.contains(queue[k].id)) k
+      ];
+      if (left.isEmpty) {
+        if (auto && repeat.value == 0) {
+          await _stopAtEnd();
+          return;
+        }
+        _played
+          ..clear()
+          ..add(c.id);
+        left = [
+          for (var k = 0; k < queue.length; k++)
+            if (k != i) k
+        ];
+      }
+      n = left[_rand.nextInt(left.length)];
+      _history.add(i);
+    } else {
+      n = i + 1;
+      if (n >= queue.length) {
+        if (auto && repeat.value == 0) {
+          await _stopAtEnd();
+          return;
+        }
+        n = 0;
+      }
+    }
+    await _start(n);
   }
 
-  static Future<void> next() => _step(1);
-  static Future<void> prev() => _step(-1);
+  static Future<void> prev() async {
+    final c = current.value;
+    if (c == null || queue.isEmpty) return;
+    if (player.position > const Duration(seconds: 3)) {
+      await player.seek(Duration.zero);
+      return;
+    }
+    if (shuffle.value && _history.isNotEmpty) {
+      await _start(_history.removeLast());
+      return;
+    }
+    final i = _indexOf(c);
+    await _start((i - 1 + queue.length) % queue.length);
+  }
+
+  static void toggleShuffle() => shuffle.value = !shuffle.value;
+
+  static void cycleRepeat() {
+    repeat.value = repeat.value == 1 ? 2 : (repeat.value == 2 ? 0 : 1);
+  }
+
+  static Future<void> setSpeed(double v) async {
+    speed.value = v;
+    await player.setSpeed(v);
+  }
+
+  /// مؤقت النوم: null = إلغاء
+  static void setSleep(Duration? d) {
+    _sleepTimer?.cancel();
+    sleepAfterSong.value = false;
+    if (d == null) {
+      sleepEnd.value = null;
+      return;
+    }
+    sleepEnd.value = DateTime.now().add(d);
+    _sleepTimer = Timer(d, () {
+      player.pause();
+      sleepEnd.value = null;
+    });
+  }
+
+  static void sleepAtSongEnd() {
+    _sleepTimer?.cancel();
+    sleepEnd.value = null;
+    sleepAfterSong.value = true;
+  }
 }
 
 const ink = Color(0xFF1B1424);
@@ -274,6 +547,7 @@ Future<void> main() async {
     androidNotificationChannelName: 'تشغيل الموسيقى',
     androidNotificationOngoing: true,
   );
+  await Ctrl.loadPrefs();
   Ctrl.init();
   runApp(const App());
 }
@@ -365,12 +639,323 @@ List<Grp> _groupBy(
   ];
 }
 
+Future<String?> askName(BuildContext context, String title,
+    {String initial = ''}) {
+  final t = TextEditingController(text: initial);
+  return showDialog<String>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text(title),
+      content: TextField(
+        controller: t,
+        autofocus: true,
+        decoration: const InputDecoration(labelText: 'الاسم'),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+        FilledButton(
+            onPressed: () => Navigator.pop(ctx, t.text.trim()),
+            child: const Text('حفظ')),
+      ],
+    ),
+  );
+}
+
+Future<void> addToPlaylistFlow(BuildContext context, SongModel s) async {
+  final lists = await Db.playlists();
+  if (!context.mounted) return;
+  final pick = await showDialog<int>(
+    context: context,
+    builder: (ctx) => SimpleDialog(
+      title: const Text('إضافة إلى قائمة'),
+      children: [
+        SimpleDialogOption(
+          onPressed: () => Navigator.pop(ctx, -1),
+          child: const Row(children: [
+            Icon(Icons.add, color: saffron),
+            SizedBox(width: 8),
+            Text('قائمة جديدة'),
+          ]),
+        ),
+        for (final l in lists)
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, l['id'] as int),
+            child: Text('${l['name']}  (${l['n']})'),
+          ),
+      ],
+    ),
+  );
+  if (pick == null || !context.mounted) return;
+  var pid = pick;
+  if (pid == -1) {
+    final name = await askName(context, 'قائمة جديدة');
+    if (name == null || name.isEmpty) return;
+    pid = await Db.newPlaylist(name);
+  }
+  await Db.addToPlaylist(pid, s.id);
+  if (context.mounted) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('تمت الإضافة')));
+  }
+}
+
+/// قائمة خيارات الأغنية (ضغطة مطوّلة)
+Future<void> showSongMenu(BuildContext context, SongModel s,
+    {int? playlistId, VoidCallback? onChanged}) async {
+  final favs = await Db.favs();
+  if (!context.mounted) return;
+  final isFav = favs.contains(s.id);
+  await showModalBottomSheet<void>(
+    context: context,
+    backgroundColor: surface,
+    builder: (ctx) => SafeArea(
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        ListTile(
+          title: Text(s.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+        ),
+        ListTile(
+          leading: Icon(isFav ? Icons.favorite_border : Icons.favorite),
+          title: Text(isFav ? 'إزالة من المفضلة' : 'إضافة للمفضلة'),
+          onTap: () async {
+            Navigator.pop(ctx);
+            await Db.setFav(s.id, !isFav);
+            onChanged?.call();
+          },
+        ),
+        ListTile(
+          leading: const Icon(Icons.playlist_add),
+          title: const Text('إضافة إلى قائمة تشغيل'),
+          onTap: () async {
+            Navigator.pop(ctx);
+            await addToPlaylistFlow(context, s);
+            onChanged?.call();
+          },
+        ),
+        if (playlistId != null && playlistId > 0)
+          ListTile(
+            leading: const Icon(Icons.remove_circle_outline),
+            title: const Text('إزالة من هذي القائمة'),
+            onTap: () async {
+              Navigator.pop(ctx);
+              await Db.removeFromPlaylist(playlistId!, s.id);
+              onChanged?.call();
+            },
+          ),
+      ]),
+    ),
+  );
+}
+
+class FavButton extends StatefulWidget {
+  final int id;
+  const FavButton({super.key, required this.id});
+  @override
+  State<FavButton> createState() => _FavButtonState();
+}
+
+class _FavButtonState extends State<FavButton> {
+  bool fav = false;
+
+  @override
+  void initState() {
+    super.initState();
+    Db.favs().then((set) {
+      if (mounted) setState(() => fav = set.contains(widget.id));
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      tooltip: 'المفضلة',
+      icon: Icon(fav ? Icons.favorite : Icons.favorite_border,
+          color: fav ? const Color(0xFFE5737F) : null),
+      onPressed: () async {
+        await Db.setFav(widget.id, !fav);
+        if (mounted) setState(() => fav = !fav);
+      },
+    );
+  }
+}
+
+void showPlaySettings(BuildContext context) {
+  showModalBottomSheet<void>(
+    context: context,
+    backgroundColor: surface,
+    isScrollControlled: true,
+    builder: (ctx) => const SafeArea(
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(20, 16, 20, 20),
+        child: _PlaySettings(),
+      ),
+    ),
+  );
+}
+
+class _PlaySettings extends StatelessWidget {
+  const _PlaySettings();
+
+  Widget _title(String t) => Padding(
+        padding: const EdgeInsets.only(top: 14, bottom: 6),
+        child: Text(t, style: const TextStyle(color: muted)),
+      );
+
+  String _hm(DateTime d) =>
+      '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _title('حجم خط الكلمات'),
+        ValueListenableBuilder<double>(
+          valueListenable: Ctrl.fontScale,
+          builder: (c, v, _) => Row(children: [
+            const Text('أ', style: TextStyle(fontSize: 14)),
+            Expanded(
+              child: Slider(
+                value: v,
+                min: 0.8,
+                max: 1.6,
+                divisions: 8,
+                label: v.toStringAsFixed(1),
+                onChanged: (x) => Ctrl.fontScale.value = x,
+              ),
+            ),
+            const Text('أ', style: TextStyle(fontSize: 24)),
+          ]),
+        ),
+        _title('سرعة التشغيل'),
+        ValueListenableBuilder<double>(
+          valueListenable: Ctrl.speed,
+          builder: (c, v, _) => Wrap(spacing: 8, children: [
+            for (final x in const [0.75, 1.0, 1.25, 1.5])
+              ChoiceChip(
+                label: Text('${x}x'),
+                selected: v == x,
+                onSelected: (_) => Ctrl.setSpeed(x),
+              ),
+          ]),
+        ),
+        _title('مؤقت النوم'),
+        ValueListenableBuilder<DateTime?>(
+          valueListenable: Ctrl.sleepEnd,
+          builder: (c, end, _) => ValueListenableBuilder<bool>(
+            valueListenable: Ctrl.sleepAfterSong,
+            builder: (c, after, _) => Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Wrap(spacing: 8, children: [
+                  ChoiceChip(
+                    label: const Text('إيقاف'),
+                    selected: end == null && !after,
+                    onSelected: (_) => Ctrl.setSleep(null),
+                  ),
+                  for (final m in const [15, 30, 45, 60])
+                    ChoiceChip(
+                      label: Text('$m دقيقة'),
+                      selected: false,
+                      onSelected: (_) => Ctrl.setSleep(Duration(minutes: m)),
+                    ),
+                  ChoiceChip(
+                    label: const Text('بعد هذي الأغنية'),
+                    selected: after,
+                    onSelected: (_) => Ctrl.sleepAtSongEnd(),
+                  ),
+                ]),
+                if (end != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text('يوقف التشغيل الساعة ${_hm(end)}',
+                        style: const TextStyle(color: saffron)),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// غلاف الأغنية (أو أيقونة إذا ماكو غلاف)
+class Cover extends StatelessWidget {
+  final int id;
+  final double size;
+  final double radius;
+  const Cover(this.id, {super.key, this.size = 48, this.radius = 8});
+
+  @override
+  Widget build(BuildContext context) {
+    final r = BorderRadius.circular(radius);
+    return QueryArtworkWidget(
+      id: id,
+      type: ArtworkType.AUDIO,
+      artworkWidth: size,
+      artworkHeight: size,
+      artworkBorder: r,
+      artworkFit: BoxFit.cover,
+      keepOldArtwork: true,
+      nullArtworkWidget: Container(
+        width: size,
+        height: size,
+        decoration: BoxDecoration(color: surface, borderRadius: r),
+        child: Icon(Icons.music_note, color: muted, size: size * 0.5),
+      ),
+    );
+  }
+}
+
+/// خلفية شاشة التشغيل: الغلاف مغبّش ومعتّم خلف الكلمات
+class Backdrop extends StatelessWidget {
+  final int id;
+  const Backdrop({super.key, required this.id});
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(fit: StackFit.expand, children: [
+      ImageFiltered(
+        imageFilter: ImageFilter.blur(sigmaX: 28, sigmaY: 28),
+        child: Opacity(
+          opacity: 0.5,
+          child: QueryArtworkWidget(
+            id: id,
+            type: ArtworkType.AUDIO,
+            size: 400,
+            quality: 80,
+            artworkWidth: double.infinity,
+            artworkHeight: double.infinity,
+            artworkBorder: BorderRadius.zero,
+            artworkFit: BoxFit.cover,
+            keepOldArtwork: true,
+            nullArtworkWidget: const SizedBox.shrink(),
+          ),
+        ),
+      ),
+      Container(color: ink.withOpacity(0.5)),
+    ]);
+  }
+}
+
 class SongTile extends StatelessWidget {
   final SongModel song;
   final bool hasLyrics;
+  final bool isFav;
   final VoidCallback onTap;
-  const SongTile(
-      {super.key, required this.song, required this.hasLyrics, required this.onTap});
+  final VoidCallback? onLong;
+  const SongTile({
+    super.key,
+    required this.song,
+    required this.hasLyrics,
+    required this.onTap,
+    this.isFav = false,
+    this.onLong,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -383,9 +968,17 @@ class SongTile extends StatelessWidget {
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(color: muted)),
-      leading: const Icon(Icons.music_note, color: muted),
-      trailing: hasLyrics ? const Icon(Icons.lyrics, color: saffron, size: 20) : null,
+      leading: Cover(song.id),
+      trailing: (hasLyrics || isFav)
+          ? Row(mainAxisSize: MainAxisSize.min, children: [
+              if (isFav)
+                const Icon(Icons.favorite, color: Color(0xFFE5737F), size: 18),
+              if (isFav && hasLyrics) const SizedBox(width: 6),
+              if (hasLyrics) const Icon(Icons.lyrics, color: saffron, size: 20),
+            ])
+          : null,
       onTap: onTap,
+      onLongPress: onLong,
     );
   }
 }
@@ -405,6 +998,7 @@ class MiniPlayer extends StatelessWidget {
             child: ListTile(
               onTap: () => Navigator.push(
                   context, MaterialPageRoute(builder: (_) => const PlayerPage())),
+              leading: Cover(s.id, size: 40, radius: 6),
               title: Text(s.title, maxLines: 1, overflow: TextOverflow.ellipsis),
               trailing: StreamBuilder<bool>(
                 stream: Ctrl.player.playingStream,
@@ -423,16 +1017,23 @@ class MiniPlayer extends StatelessWidget {
   }
 }
 
-/// صفحة داخل فنان / ألبوم / مجلد
+/// صفحة داخل فنان / ألبوم / مجلد / قائمة تشغيل
 class GroupPage extends StatefulWidget {
   final Grp group;
-  const GroupPage({super.key, required this.group});
+
+  /// null = عادي، -1 = المفضلة، غير ذلك = رقم قائمة تشغيل
+  final int? playlistId;
+  final List<SongModel> allSongs;
+  const GroupPage(
+      {super.key, required this.group, this.playlistId, this.allSongs = const []});
   @override
   State<GroupPage> createState() => _GroupPageState();
 }
 
 class _GroupPageState extends State<GroupPage> {
   Set<int> ids = {};
+  Set<int> favs = {};
+  late List<SongModel> songs = widget.group.songs;
 
   @override
   void initState() {
@@ -442,11 +1043,28 @@ class _GroupPageState extends State<GroupPage> {
 
   Future<void> _refresh() async {
     final r = await Db.ids();
-    if (mounted) setState(() => ids = r);
+    final f = await Db.favs();
+    List<SongModel>? list;
+    final pid = widget.playlistId;
+    if (pid != null) {
+      final order = pid == -1 ? f.toList() : await Db.playlistSongIds(pid);
+      final byId = {for (final s in widget.allSongs) s.id: s};
+      list = [
+        for (final i in order)
+          if (byId[i] != null) byId[i]!
+      ];
+    }
+    if (!mounted) return;
+    setState(() {
+      ids = r;
+      favs = f;
+      if (list != null) songs = list;
+    });
   }
 
   Future<void> _play(int i) async {
-    Ctrl.play(widget.group.songs, i);
+    if (songs.isEmpty) return;
+    Ctrl.play(songs, i, name: widget.group.title);
     await Navigator.push(
         context, MaterialPageRoute(builder: (_) => const PlayerPage()));
     _refresh();
@@ -465,14 +1083,27 @@ class _GroupPageState extends State<GroupPage> {
               icon: const Icon(Icons.play_circle_fill, color: saffron)),
         ],
       ),
-      body: ListView.builder(
-        itemCount: g.songs.length,
-        itemBuilder: (c, i) => SongTile(
-          song: g.songs[i],
-          hasLyrics: ids.contains(g.songs[i].id),
-          onTap: () => _play(i),
-        ),
-      ),
+      body: songs.isEmpty
+          ? const Center(
+              child: Padding(
+                padding: EdgeInsets.all(32),
+                child: Text(
+                  'ماكو أغاني هنا.\nاضغط مطولاً على أي أغنية وأضفها.',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            )
+          : ListView.builder(
+              itemCount: songs.length,
+              itemBuilder: (c, i) => SongTile(
+                song: songs[i],
+                hasLyrics: ids.contains(songs[i].id),
+                isFav: favs.contains(songs[i].id),
+                onTap: () => _play(i),
+                onLong: () => showSongMenu(context, songs[i],
+                    playlistId: widget.playlistId, onChanged: _refresh),
+              ),
+            ),
       bottomNavigationBar: const MiniPlayer(),
     );
   }
@@ -488,8 +1119,12 @@ class _HomeState extends State<Home> {
   final _q = OnAudioQuery();
   List<SongModel> songs = [];
   Set<int> withLyrics = {};
+  Set<int> favs = {};
+  List<Map<String, Object?>> lists = [];
   bool loading = true, denied = false;
   String filter = '';
+  String lyricsFilter = 'all'; // all | none | has
+  String sort = 'title'; // title | artist | recent
 
   @override
   void initState() {
@@ -519,25 +1154,162 @@ class _HomeState extends State<Home> {
       ignoreCase: true,
     );
     songs = all.where((s) => (s.duration ?? 0) > 30000).toList();
+    sort = await Db.getKv('sort') ?? 'title';
+    _applySort();
     withLyrics = await Db.ids();
+    favs = await Db.favs();
+    lists = await Db.playlists();
+    await Ctrl.restore(songs);
     if (mounted) setState(() => loading = false);
   }
 
-  Future<void> _refreshIds() async {
-    final ids = await Db.ids();
-    if (mounted) setState(() => withLyrics = ids);
+  void _applySort() {
+    int byTitle(SongModel a, SongModel b) =>
+        a.title.toLowerCase().compareTo(b.title.toLowerCase());
+    if (sort == 'recent') {
+      songs.sort((a, b) {
+        final c = b.id.compareTo(a.id); // رقم أكبر = أضيفت أحدث
+        return c != 0 ? c : byTitle(a, b);
+      });
+    } else if (sort == 'artist') {
+      songs.sort((a, b) {
+        final c = cleanArtist(a.artist)
+            .toLowerCase()
+            .compareTo(cleanArtist(b.artist).toLowerCase());
+        return c != 0 ? c : byTitle(a, b);
+      });
+    } else {
+      songs.sort(byTitle);
+    }
   }
 
-  Future<void> _playFrom(List<SongModel> list, int i) async {
-    Ctrl.play(list, i);
+  Future<void> _pickSort() async {
+    final v = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('ترتيب الأغاني'),
+        children: [
+          for (final o in const [
+            ['title', 'بالاسم'],
+            ['artist', 'بالفنان'],
+            ['recent', 'الأحدث إضافة'],
+          ])
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, o[0]),
+              child: Row(children: [
+                Icon(
+                    sort == o[0]
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_unchecked,
+                    color: saffron,
+                    size: 20),
+                const SizedBox(width: 10),
+                Text(o[1]),
+              ]),
+            ),
+        ],
+      ),
+    );
+    if (v == null) return;
+    setState(() {
+      sort = v;
+      _applySort();
+    });
+    Db.setKv('sort', v);
+  }
+
+  Future<void> _refreshMeta() async {
+    final ids = await Db.ids();
+    final f = await Db.favs();
+    final l = await Db.playlists();
+    if (mounted) {
+      setState(() {
+        withLyrics = ids;
+        favs = f;
+        lists = l;
+      });
+    }
+  }
+
+  Future<void> _playFrom(List<SongModel> list, int i, {String? name}) async {
+    Ctrl.play(list, i, name: name);
     await Navigator.push(
         context, MaterialPageRoute(builder: (_) => const PlayerPage()));
-    _refreshIds();
+    _refreshMeta();
   }
 
   void _toast(String t) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+  }
+
+  /// سحب كلمات كل الأغاني اللي ما عندها كلمات
+  Future<void> _bulkFetch() async {
+    final todo = songs.where((s) => !withLyrics.contains(s.id)).toList();
+    if (todo.isEmpty) {
+      _toast('كل الأغاني عندها كلمات');
+      return;
+    }
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('سحب الكلمات الناقصة'),
+        content: Text(
+            'راح أبحث بالإنترنت عن كلمات لـ ${todo.length} أغنية. ممكن ياخذ وقت، وتقدر توقفه بأي لحظة. النتائج تقريبية، وتكدر تعدّل أي كلمات بعدين.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('إلغاء')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('ابدأ')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+
+    var cancel = false;
+    var done = 0, found = 0;
+    StateSetter? setDlg;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => PopScope(
+        canPop: false,
+        child: StatefulBuilder(builder: (ctx, st) {
+          setDlg = st;
+          return AlertDialog(
+            title: const Text('جاري سحب الكلمات'),
+            content: Column(mainAxisSize: MainAxisSize.min, children: [
+              LinearProgressIndicator(value: done / todo.length),
+              const SizedBox(height: 12),
+              Text('$done / ${todo.length}  (لقيت كلمات لـ $found)'),
+            ]),
+            actions: [
+              TextButton(onPressed: () => cancel = true, child: const Text('إيقاف')),
+            ],
+          );
+        }),
+      ),
+    );
+    await Future.delayed(const Duration(milliseconds: 200));
+    for (final s in todo) {
+      if (cancel || !mounted) break;
+      try {
+        final r = await LrcLib.fetch(
+            s.title, cleanArtist(s.artist), (s.duration ?? 0) ~/ 1000);
+        if (r != null) {
+          await Db.save(s.id, r);
+          found++;
+        }
+      } catch (_) {}
+      done++;
+      setDlg?.call(() {});
+      await Future.delayed(const Duration(milliseconds: 300));
+    }
+    if (mounted) Navigator.of(context, rootNavigator: true).pop();
+    await _refreshMeta();
+    _toast('خلصت: لقيت كلمات لـ $found من $done أغنية');
   }
 
   Future<void> _export() async {
@@ -546,10 +1318,12 @@ class _HomeState extends State<Home> {
       _toast('ماكو كلمات محفوظة للتصدير');
       return;
     }
+    final trs = await Db.allTr();
     final byId = {for (final s in songs) s.id: s};
     final items = <Map<String, dynamic>>[];
     for (final e in all.entries) {
       final s = byId[e.key];
+      final tr = trs[e.key];
       items.add({
         'id': e.key,
         'title': s?.title ?? '',
@@ -557,9 +1331,10 @@ class _HomeState extends State<Home> {
         'album': s?.album ?? '',
         'duration': s?.duration ?? 0,
         'lrc': e.value,
+        'tr': tr == null ? null : jsonDecode(tr),
       });
     }
-    final text = jsonEncode({'app': 'lyrics_player', 'version': 1, 'items': items});
+    final text = jsonEncode({'app': 'lyrics_player', 'version': 2, 'items': items});
     try {
       final path = await FilePicker.platform.saveFile(
         dialogTitle: 'حفظ نسخة الكلمات الاحتياطية',
@@ -614,9 +1389,16 @@ class _HomeState extends State<Home> {
           continue;
         }
         await Db.save(target.id, lrc);
+        final tr = it['tr'];
+        if (tr is List) {
+          final list = tr.map((x) => x.toString()).toList();
+          if (list.length == Lyrics.parse(lrc).length) {
+            await Db.saveTr(target.id, list);
+          }
+        }
         ok++;
       }
-      await _refreshIds();
+      await _refreshMeta();
       var msg = 'تم استيراد $ok من الكلمات';
       if (skipped > 0) msg += ' (تخطّيت $skipped لأن الأغنية غير موجودة)';
       _toast(msg);
@@ -625,14 +1407,112 @@ class _HomeState extends State<Home> {
     }
   }
 
-  Widget _groupsTab(List<Grp> gs, IconData icon) {
+  Future<void> _openList(int pid, String name) async {
+    final ids = pid == -1 ? (await Db.favs()).toList() : await Db.playlistSongIds(pid);
+    final byId = {for (final s in songs) s.id: s};
+    final list = [
+      for (final i in ids)
+        if (byId[i] != null) byId[i]!
+    ];
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => GroupPage(
+            group: Grp(name, null, list), playlistId: pid, allSongs: songs),
+      ),
+    );
+    _refreshMeta();
+  }
+
+  Future<void> _listMenu(int pid, String name) async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: surface,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(
+              leading: const Icon(Icons.edit),
+              title: const Text('إعادة تسمية'),
+              onTap: () => Navigator.pop(ctx, 'rename')),
+          ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('حذف القائمة'),
+              onTap: () => Navigator.pop(ctx, 'delete')),
+        ]),
+      ),
+    );
+    if (!mounted) return;
+    if (choice == 'rename') {
+      final n = await askName(context, 'إعادة تسمية', initial: name);
+      if (n != null && n.isNotEmpty) {
+        await Db.renamePlaylist(pid, n);
+        _refreshMeta();
+      }
+    } else if (choice == 'delete') {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('حذف القائمة؟'),
+          content: Text('راح تنحذف القائمة "$name" (الأغاني نفسها ما تنحذف).'),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('إلغاء')),
+            FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('حذف')),
+          ],
+        ),
+      );
+      if (ok == true) {
+        await Db.deletePlaylist(pid);
+        _refreshMeta();
+      }
+    }
+  }
+
+  Widget _listsTab() {
+    final byId = {for (final s in songs) s.id: s};
+    final favCount = favs.where(byId.containsKey).length;
+    return ListView(children: [
+      ListTile(
+        leading: const Icon(Icons.add_circle_outline, color: saffron),
+        title: const Text('قائمة جديدة'),
+        onTap: () async {
+          final name = await askName(context, 'قائمة جديدة');
+          if (name == null || name.isEmpty) return;
+          await Db.newPlaylist(name);
+          _refreshMeta();
+        },
+      ),
+      ListTile(
+        leading: const Icon(Icons.favorite, color: Color(0xFFE5737F)),
+        title: const Text('المفضلة'),
+        subtitle: Text('$favCount أغنية', style: const TextStyle(color: muted)),
+        trailing: const Icon(Icons.chevron_left, color: muted),
+        onTap: () => _openList(-1, 'المفضلة'),
+      ),
+      for (final l in lists)
+        ListTile(
+          leading: const Icon(Icons.queue_music, color: muted),
+          title: Text('${l['name']}'),
+          subtitle: Text('${l['n']} أغنية', style: const TextStyle(color: muted)),
+          trailing: const Icon(Icons.chevron_left, color: muted),
+          onTap: () => _openList(l['id'] as int, '${l['name']}'),
+          onLongPress: () => _listMenu(l['id'] as int, '${l['name']}'),
+        ),
+    ]);
+  }
+
+  Widget _groupsTab(List<Grp> gs, IconData icon, {bool art = false}) {
     if (gs.isEmpty) return const Center(child: Text('ماكو نتائج'));
     return ListView.builder(
       itemCount: gs.length,
       itemBuilder: (c, i) {
         final g = gs[i];
         return ListTile(
-          leading: Icon(icon, color: muted),
+          leading: art ? Cover(g.songs.first.id) : Icon(icon, color: muted),
           title: Text(g.title, maxLines: 1, overflow: TextOverflow.ellipsis),
           subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Text('${g.songs.length} أغنية', style: const TextStyle(color: muted)),
@@ -647,7 +1527,7 @@ class _HomeState extends State<Home> {
           onTap: () async {
             await Navigator.push(
                 context, MaterialPageRoute(builder: (_) => GroupPage(group: g)));
-            _refreshIds();
+            _refreshMeta();
           },
         );
       },
@@ -657,7 +1537,7 @@ class _HomeState extends State<Home> {
   @override
   Widget build(BuildContext context) {
     final f = filter.trim().toLowerCase();
-    final shown = f.isEmpty
+    var shown = f.isEmpty
         ? songs
         : songs
             .where((s) =>
@@ -666,6 +1546,13 @@ class _HomeState extends State<Home> {
                 _albumOf(s).toLowerCase().contains(f) ||
                 _lastSeg(_dirOf(s)).toLowerCase().contains(f))
             .toList();
+    if (lyricsFilter == 'none') {
+      shown = shown.where((s) => !withLyrics.contains(s.id)).toList();
+    } else if (lyricsFilter == 'has') {
+      shown = shown.where((s) => withLyrics.contains(s.id)).toList();
+    }
+    final noLyricsCount = songs.where((s) => !withLyrics.contains(s.id)).length;
+    final scoped = f.isNotEmpty || lyricsFilter != 'all';
 
     Widget body;
     if (loading) {
@@ -695,39 +1582,58 @@ class _HomeState extends State<Home> {
                 itemBuilder: (c, i) => SongTile(
                   song: shown[i],
                   hasLyrics: withLyrics.contains(shown[i].id),
-                  onTap: () => _playFrom(shown, i),
+                  isFav: favs.contains(shown[i].id),
+                  onTap: () =>
+                      _playFrom(shown, i, name: scoped ? 'نتائج البحث' : null),
+                  onLong: () =>
+                      showSongMenu(context, shown[i], onChanged: _refreshMeta),
                 ),
               ),
-        _groupsTab(_groupBy(shown, _artistOf), Icons.person),
-        _groupsTab(_groupBy(shown, _albumOf), Icons.album),
+        _groupsTab(_groupBy(shown, _artistOf), Icons.person, art: true),
+        _groupsTab(_groupBy(shown, _albumOf), Icons.album, art: true),
         _groupsTab(
           _groupBy(shown, _dirOf, title: _lastSeg, sub: _parentSeg),
           Icons.folder,
         ),
+        _listsTab(),
       ]);
     }
 
     return DefaultTabController(
-      length: 4,
+      length: 5,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('مشغل الكلمات'),
           actions: [
             PopupMenuButton<String>(
               onSelected: (v) {
-                if (v == 'export') {
-                  _export();
-                } else {
-                  _import();
+                switch (v) {
+                  case 'sort':
+                    _pickSort();
+                    break;
+                  case 'bulk':
+                    _bulkFetch();
+                    break;
+                  case 'export':
+                    _export();
+                    break;
+                  case 'import':
+                    _import();
+                    break;
                 }
               },
               itemBuilder: (c) => const [
-                PopupMenuItem(value: 'export', child: Text('تصدير الكلمات (نسخة احتياطية)')),
+                PopupMenuItem(value: 'sort', child: Text('ترتيب الأغاني')),
+                PopupMenuItem(
+                    value: 'bulk', child: Text('سحب كلمات الأغاني الناقصة')),
+                PopupMenuItem(
+                    value: 'export', child: Text('تصدير الكلمات (نسخة احتياطية)')),
                 PopupMenuItem(value: 'import', child: Text('استيراد الكلمات')),
               ],
             ),
           ],
           bottom: const TabBar(
+            isScrollable: true,
             indicatorColor: saffron,
             labelColor: saffron,
             unselectedLabelColor: muted,
@@ -736,12 +1642,13 @@ class _HomeState extends State<Home> {
               Tab(text: 'الفنانين'),
               Tab(text: 'الألبومات'),
               Tab(text: 'المجلدات'),
+              Tab(text: 'القوائم'),
             ],
           ),
         ),
         body: Column(children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
             child: TextField(
               onChanged: (v) => setState(() => filter = v),
               decoration: InputDecoration(
@@ -754,6 +1661,28 @@ class _HomeState extends State<Home> {
                   borderSide: BorderSide.none,
                 ),
               ),
+            ),
+          ),
+          SizedBox(
+            height: 46,
+            child: ListView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              children: [
+                for (final o in [
+                  ['all', 'الكل'],
+                  ['none', 'بدون كلمات ($noLyricsCount)'],
+                  ['has', 'مع كلمات'],
+                ])
+                  Padding(
+                    padding: const EdgeInsetsDirectional.only(end: 8),
+                    child: ChoiceChip(
+                      label: Text(o[1]),
+                      selected: lyricsFilter == o[0],
+                      onSelected: (_) => setState(() => lyricsFilter = o[0]),
+                    ),
+                  ),
+              ],
             ),
           ),
           Expanded(child: body),
@@ -826,17 +1755,38 @@ class PlayerPage extends StatelessWidget {
         final artist = cleanArtist(s.artist);
         return Scaffold(
           appBar: AppBar(
-            title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(s.title, maxLines: 1, overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 17)),
-              if (artist.isNotEmpty)
-                Text(artist, maxLines: 1, overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 13, color: muted)),
+            title: Row(children: [
+              Cover(s.id, size: 40, radius: 6),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(s.title, maxLines: 1, overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 17)),
+                  if (artist.isNotEmpty)
+                    Text(artist, maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 13, color: muted)),
+                ]),
+              ),
             ]),
+            actions: [
+              FavButton(key: ValueKey(s.id), id: s.id),
+              ValueListenableBuilder<DateTime?>(
+                valueListenable: Ctrl.sleepEnd,
+                builder: (c, end, _) => IconButton(
+                  tooltip: 'إعدادات التشغيل',
+                  onPressed: () => showPlaySettings(context),
+                  icon: Icon(end != null ? Icons.bedtime : Icons.tune,
+                      color: end != null ? saffron : null),
+                ),
+              ),
+            ],
           ),
-          body: Column(children: [
-            Expanded(child: LyricsView(key: ValueKey(s.id), song: s)),
-            const Controls(),
+          body: Stack(children: [
+            Positioned.fill(child: Backdrop(id: s.id)),
+            Column(children: [
+              Expanded(child: LyricsView(key: ValueKey(s.id), song: s)),
+              const Controls(),
+            ]),
           ]),
         );
       },
@@ -866,11 +1816,17 @@ class _LyricsViewState extends State<LyricsView> {
   void initState() {
     super.initState();
     _load();
+    Ctrl.fontScale.addListener(_onFont);
     sub = Ctrl.player.positionStream.listen(_onPos);
+  }
+
+  void _onFont() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
+    Ctrl.fontScale.removeListener(_onFont);
     sub?.cancel();
     super.dispose();
   }
@@ -880,8 +1836,10 @@ class _LyricsViewState extends State<LyricsView> {
     final l = raw == null ? null : Lyrics.parse(raw);
     var t = raw == null ? null : await Db.getTr(widget.song.id);
     if (l != null && t != null && t.length != l.length) t = null;
+    final off = int.tryParse(await Db.getKv('off_${widget.song.id}') ?? '') ?? 0;
     if (!mounted) return;
     setState(() {
+      offsetMs = off;
       lyrics = l;
       tr = t;
       loading = false;
@@ -904,7 +1862,7 @@ class _LyricsViewState extends State<LyricsView> {
       msg.hideCurrentSnackBar();
       if (t.every((e) => e.isEmpty)) {
         msg.showSnackBar(
-            const SnackBar(content: Text('ماكو سطور عربية تحتاج ترجمة')));
+            const SnackBar(content: Text('ماكو سطور إنكليزية تحتاج ترجمة')));
       } else {
         await Db.saveTr(widget.song.id, t);
         if (mounted) {
@@ -963,6 +1921,11 @@ class _LyricsViewState extends State<LyricsView> {
     }
   }
 
+  void _bump(int d) {
+    setState(() => offsetMs += d);
+    Db.setKv('off_${widget.song.id}', '$offsetMs');
+  }
+
   void _seekTo(LyricLine l) {
     var d = l.time - Duration(milliseconds: offsetMs);
     if (d < Duration.zero) d = Duration.zero;
@@ -971,6 +1934,7 @@ class _LyricsViewState extends State<LyricsView> {
 
   Widget _line(int i) {
     final l = lyrics!;
+    final fs = Ctrl.fontScale.value;
     final raw = l.synced ? l.lines[i].text : l.plain[i];
     final text = raw.isEmpty ? (l.synced ? '♪' : ' ') : raw;
     final on = l.synced && i == active;
@@ -985,7 +1949,7 @@ class _LyricsViewState extends State<LyricsView> {
             child: AnimatedDefaultTextStyle(
               duration: const Duration(milliseconds: 250),
               style: TextStyle(
-                fontSize: on ? 27 : 20,
+                fontSize: (on ? 27 : 20) * fs,
                 height: 1.45,
                 fontWeight: on ? FontWeight.w700 : FontWeight.w400,
                 color: on ? saffron : (l.synced ? muted : paper),
@@ -999,13 +1963,12 @@ class _LyricsViewState extends State<LyricsView> {
               padding: const EdgeInsets.only(top: 2),
               child: Text(
                 t,
-                textDirection: TextDirection.ltr,
+                textDirection: TextDirection.rtl,
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                  fontSize: on ? 17 : 15,
-                  height: 1.35,
-                  fontStyle: FontStyle.italic,
-                  color: on ? paper : muted.withOpacity(0.8),
+                  fontSize: (on ? 18 : 16) * fs,
+                  height: 1.4,
+                  color: on ? paper : muted.withOpacity(0.85),
                 ),
               ),
             ),
@@ -1061,7 +2024,7 @@ class _LyricsViewState extends State<LyricsView> {
                 icon: const Icon(Icons.cloud_download)),
             IconButton(
               tooltip: tr == null
-                  ? 'ترجمة للإنكليزي'
+                  ? 'ترجمة للعربي'
                   : (showTr ? 'إخفاء الترجمة' : 'إظهار الترجمة'),
               onPressed: translating
                   ? null
@@ -1083,7 +2046,7 @@ class _LyricsViewState extends State<LyricsView> {
             const Spacer(),
             if (lyrics!.synced) ...[
               IconButton(
-                  onPressed: () => setState(() => offsetMs -= 500),
+                  onPressed: () => _bump(-500),
                   icon: const Icon(Icons.remove_circle_outline)),
               SizedBox(
                 width: 48,
@@ -1094,7 +2057,7 @@ class _LyricsViewState extends State<LyricsView> {
                 ),
               ),
               IconButton(
-                  onPressed: () => setState(() => offsetMs += 500),
+                  onPressed: () => _bump(500),
                   icon: const Icon(Icons.add_circle_outline)),
             ],
           ]),
@@ -1115,6 +2078,16 @@ class Controls extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
           child: Column(mainAxisSize: MainAxisSize.min, children: [
+            ValueListenableBuilder<SongModel?>(
+              valueListenable: Ctrl.current,
+              builder: (c, _, __) => Directionality(
+                textDirection: TextDirection.rtl,
+                child: Text('التشغيل من: ${Ctrl.queueName}',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: muted, fontSize: 12)),
+              ),
+            ),
             StreamBuilder<Duration?>(
               stream: Ctrl.player.durationStream,
               builder: (c, ds) {
@@ -1148,11 +2121,19 @@ class Controls extends StatelessWidget {
               },
             ),
             Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              ValueListenableBuilder<bool>(
+                valueListenable: Ctrl.shuffle,
+                builder: (c, on, _) => IconButton(
+                  tooltip: 'تشغيل عشوائي',
+                  onPressed: Ctrl.toggleShuffle,
+                  icon: Icon(Icons.shuffle, color: on ? saffron : muted),
+                ),
+              ),
               IconButton(
                   iconSize: 38,
                   onPressed: Ctrl.prev,
                   icon: const Icon(Icons.skip_previous)),
-              const SizedBox(width: 12),
+              const SizedBox(width: 4),
               StreamBuilder<PlayerState>(
                 stream: Ctrl.player.playerStateStream,
                 builder: (c, st) {
@@ -1167,11 +2148,22 @@ class Controls extends StatelessWidget {
                   );
                 },
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 4),
               IconButton(
                   iconSize: 38,
                   onPressed: Ctrl.next,
                   icon: const Icon(Icons.skip_next)),
+              ValueListenableBuilder<int>(
+                valueListenable: Ctrl.repeat,
+                builder: (c, m, _) => IconButton(
+                  tooltip: m == 0
+                      ? 'بدون تكرار'
+                      : (m == 1 ? 'تكرار القائمة' : 'تكرار الأغنية'),
+                  onPressed: Ctrl.cycleRepeat,
+                  icon: Icon(m == 2 ? Icons.repeat_one : Icons.repeat,
+                      color: m == 0 ? muted : saffron),
+                ),
+              ),
             ]),
           ]),
         ),
@@ -1190,6 +2182,134 @@ class EditPage extends StatefulWidget {
 
 class _EditPageState extends State<EditPage> {
   late final TextEditingController c = TextEditingController(text: widget.initial);
+  final focus = FocusNode();
+  bool stamping = false;
+  final List<TextEditingValue> _undo = [];
+
+  // تعويض بسيط لتأخر ضغطة الإصبع عن بداية السطر
+  static const _reaction = Duration(milliseconds: 250);
+  static final _tsPrefix =
+      RegExp(r'^\s*(\[\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?\]\s*)+');
+
+  @override
+  void dispose() {
+    c.dispose();
+    focus.dispose();
+    super.dispose();
+  }
+
+  String _clock(Duration d) {
+    final m = d.inMinutes.toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    final h = ((d.inMilliseconds ~/ 10) % 100).toString().padLeft(2, '0');
+    return '$m:$s.$h';
+  }
+
+  void _toast(String t) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+  }
+
+  int _lineStart(String text, int off) =>
+      off <= 0 ? 0 : text.lastIndexOf('\n', off - 1) + 1;
+
+  int _cursor() {
+    final text = c.text;
+    var off = c.selection.baseOffset;
+    if (off < 0) off = 0;
+    if (off > text.length) off = text.length;
+    return off;
+  }
+
+  /// يختم وقت الأغنية الحالي على السطر اللي عليه المؤشر، وينتقل للسطر التالي
+  void _stamp() {
+    if (Ctrl.current.value?.id != widget.song.id) {
+      _toast('الأغنية الحالية تغيّرت. ارجع وافتح كلمات الأغنية اللي تشتغل هسه.');
+      return;
+    }
+    final text = c.text;
+    final off = _cursor();
+    final start = _lineStart(text, off);
+    var end = text.indexOf('\n', off);
+    if (end < 0) end = text.length;
+    final body = text.substring(start, end).replaceFirst(_tsPrefix, '').trimLeft();
+    var pos = Ctrl.player.position - _reaction;
+    if (pos < Duration.zero) pos = Duration.zero;
+    final newLine = '[${_clock(pos)}] $body';
+    final newText = text.substring(0, start) + newLine + text.substring(end);
+    final next = start + newLine.length;
+    final cursor = next < newText.length ? next + 1 : next;
+    _undo.add(c.value);
+    c.value = TextEditingValue(
+      text: newText,
+      selection: TextSelection.collapsed(offset: cursor),
+    );
+  }
+
+  void _undoStamp() {
+    if (_undo.isEmpty) {
+      _toast('ماكو شي للتراجع عنه');
+      return;
+    }
+    c.value = _undo.removeLast();
+  }
+
+  Future<void> _importFile() async {
+    try {
+      final r = await FilePicker.platform
+          .pickFiles(type: FileType.any, withData: true);
+      if (r == null || r.files.isEmpty) return;
+      final b = r.files.first.bytes;
+      if (b == null) {
+        _toast('تعذّر قراءة الملف');
+        return;
+      }
+      _undo.add(c.value);
+      setState(() => c.text = utf8.decode(b, allowMalformed: true).replaceFirst('\uFEFF', ''));
+      _toast('تم استيراد الملف. اضغط ✓ للحفظ.');
+    } catch (_) {
+      _toast('تعذّر قراءة الملف');
+    }
+  }
+
+  Future<void> _exportFile() async {
+    final t = c.text.trim();
+    if (t.isEmpty) {
+      _toast('ماكو كلمات للتصدير');
+      return;
+    }
+    try {
+      final name = widget.song.title.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+      final path = await FilePicker.platform.saveFile(
+        dialogTitle: 'حفظ الكلمات',
+        fileName: '$name.lrc',
+        bytes: Uint8List.fromList(utf8.encode(t)),
+      );
+      if (path != null) _toast('تم حفظ الملف');
+    } catch (_) {
+      _toast('تعذّر حفظ الملف');
+    }
+  }
+
+  void _moveLine(int dir) {
+    final text = c.text;
+    final start = _lineStart(text, _cursor());
+    int target;
+    if (dir > 0) {
+      final nl = text.indexOf('\n', start);
+      target = nl < 0 ? text.length : nl + 1;
+    } else if (start <= 1) {
+      target = 0;
+    } else {
+      target = text.lastIndexOf('\n', start - 2) + 1;
+    }
+    c.selection = TextSelection.collapsed(offset: target);
+  }
+
+  void _seekBy(int sec) {
+    var t = Ctrl.player.position + Duration(seconds: sec);
+    if (t < Duration.zero) t = Duration.zero;
+    Ctrl.player.seek(t);
+  }
 
   Future<void> _save() async {
     final t = c.text.trim();
@@ -1206,8 +2326,147 @@ class _EditPageState extends State<EditPage> {
     if (r != null) setState(() => c.text = r);
   }
 
+  Widget _panel() {
+    return Container(
+      color: surface,
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      child: SafeArea(
+        top: false,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          SegmentedButton<bool>(
+            segments: const [
+              ButtonSegment(
+                  value: false, label: Text('تحرير النص'), icon: Icon(Icons.edit)),
+              ButtonSegment(
+                  value: true, label: Text('ختم الوقت'), icon: Icon(Icons.timer)),
+            ],
+            selected: {stamping},
+            onSelectionChanged: (v) {
+              setState(() => stamping = v.first);
+              if (stamping) {
+                focus.requestFocus();
+                SystemChannels.textInput.invokeMethod('TextInput.hide');
+              }
+            },
+          ),
+          if (stamping) ...[
+            const SizedBox(height: 8),
+            Directionality(
+              textDirection: TextDirection.ltr,
+              child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                IconButton(
+                    tooltip: 'من البداية',
+                    onPressed: () => Ctrl.player.seek(Duration.zero),
+                    icon: const Icon(Icons.skip_previous)),
+                IconButton(
+                    tooltip: 'رجوع 5 ثواني',
+                    onPressed: () => _seekBy(-5),
+                    icon: const Icon(Icons.replay_5)),
+                StreamBuilder<bool>(
+                  stream: Ctrl.player.playingStream,
+                  builder: (c2, st) {
+                    final playing = st.data ?? false;
+                    return IconButton.filled(
+                      style: IconButton.styleFrom(
+                          backgroundColor: saffron, foregroundColor: Colors.black),
+                      onPressed: () =>
+                          playing ? Ctrl.player.pause() : Ctrl.player.play(),
+                      icon: Icon(playing ? Icons.pause : Icons.play_arrow),
+                    );
+                  },
+                ),
+                IconButton(
+                    tooltip: 'تقديم 5 ثواني',
+                    onPressed: () => _seekBy(5),
+                    icon: const Icon(Icons.forward_5)),
+                StreamBuilder<Duration>(
+                  stream: Ctrl.player.positionStream,
+                  builder: (c2, st) => SizedBox(
+                    width: 64,
+                    child: Text(_clock(st.data ?? Duration.zero),
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: muted, fontSize: 13)),
+                  ),
+                ),
+              ]),
+            ),
+            const SizedBox(height: 8),
+            Row(children: [
+              IconButton.outlined(
+                  tooltip: 'تراجع عن آخر ختم',
+                  onPressed: _undoStamp,
+                  icon: const Icon(Icons.undo)),
+              const SizedBox(width: 8),
+              IconButton.outlined(
+                  tooltip: 'السطر السابق',
+                  onPressed: () => _moveLine(-1),
+                  icon: const Icon(Icons.keyboard_arrow_up)),
+              const SizedBox(width: 8),
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: _stamp,
+                  icon: const Icon(Icons.timer),
+                  label: const Text('ختم الوقت للسطر'),
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size.fromHeight(52),
+                    backgroundColor: saffron,
+                    foregroundColor: Colors.black,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton.outlined(
+                  tooltip: 'السطر التالي',
+                  onPressed: () => _moveLine(1),
+                  icon: const Icon(Icons.keyboard_arrow_down)),
+            ]),
+          ],
+        ]),
+      ),
+    );
+  }
+
+  Future<void> _onPop(bool didPop, Object? result) async {
+    if (didPop) return;
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('تريد تحفظ التغييرات؟'),
+        content: const Text('عندك تعديلات (أو أختام وقت) ما انحفظت.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, 'cancel'),
+              child: const Text('رجوع للتعديل')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, 'discard'),
+              child: const Text('تجاهل')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, 'save'),
+              child: const Text('حفظ')),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    if (choice == 'save') {
+      await _save();
+    } else if (choice == 'discard') {
+      Navigator.pop(context);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    return ValueListenableBuilder<TextEditingValue>(
+      valueListenable: c,
+      builder: (context, value, _) => PopScope(
+        canPop: value.text == widget.initial,
+        onPopInvokedWithResult: _onPop,
+        child: _scaffold(),
+      ),
+    );
+  }
+
+  Widget _scaffold() {
     return Scaffold(
       appBar: AppBar(
         title: const Text('تعديل الكلمات'),
@@ -1217,20 +2476,34 @@ class _EditPageState extends State<EditPage> {
               onPressed: _fetch,
               icon: const Icon(Icons.cloud_download)),
           IconButton(tooltip: 'حفظ', onPressed: _save, icon: const Icon(Icons.check)),
+          PopupMenuButton<String>(
+            onSelected: (v) => v == 'import' ? _importFile() : _exportFile(),
+            itemBuilder: (c) => const [
+              PopupMenuItem(
+                  value: 'import', child: Text('استيراد من ملف (.lrc / .txt)')),
+              PopupMenuItem(value: 'export', child: Text('تصدير كملف .lrc')),
+            ],
+          ),
         ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(children: [
-          const Text(
-            'للتزامن اكتب كل سطر بهذي الصيغة:  [01:23.50] نص السطر\n'
-            'أو الصق نص عادي بدون توقيت (يظهر بدون تزامن). مسح كل النص يحذف الكلمات.',
-            style: TextStyle(color: muted, fontSize: 13, height: 1.5),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+          child: Text(
+            stamping
+                ? 'اضغط على السطر اللي تريد تختمه، شغّل الأغنية، واضغط الزر لحظة ما يبدأ السطر. المؤشر ينتقل للسطر التالي لحاله.'
+                : 'اكتب أو الصق الكلمات (سطر لكل جملة)، وبعدها اختر "ختم الوقت" حتى تتزامن مع الأغنية. مسح كل النص يحذف الكلمات.',
+            style: const TextStyle(color: muted, fontSize: 13, height: 1.5),
           ),
-          const SizedBox(height: 12),
-          Expanded(
+        ),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
             child: TextField(
               controller: c,
+              focusNode: focus,
+              readOnly: stamping,
+              showCursor: true,
               maxLines: null,
               expands: true,
               textAlignVertical: TextAlignVertical.top,
@@ -1244,8 +2517,10 @@ class _EditPageState extends State<EditPage> {
               ),
             ),
           ),
-        ]),
-      ),
+        ),
+        const SizedBox(height: 8),
+        _panel(),
+      ]),
     );
   }
 }
