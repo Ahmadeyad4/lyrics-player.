@@ -1,16 +1,27 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show File, Process;
+import 'dart:io' show File;
 import 'dart:math' show Random;
 import 'dart:typed_data';
 import 'dart:ui' show ImageFilter;
+import 'package:audio_service/audio_service.dart'
+    show
+        AudioProcessingState,
+        AudioService,
+        AudioServiceConfig,
+        BaseAudioHandler,
+        MediaAction,
+        MediaControl,
+        MediaItem,
+        PlaybackState,
+        SeekHandler;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:just_audio/just_audio.dart';
-import 'package:just_audio_background/just_audio_background.dart';
+
 import 'package:on_audio_query/on_audio_query.dart';
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
@@ -577,12 +588,86 @@ const saffron = Color(0xFFF2B84B);
 const paper = Color(0xFFF3ECE2);
 const muted = Color(0xFF9B8FAE);
 
+/// يربط إشعار التشغيل / شاشة القفل / أزرار السماعة بالمشغّل الرئيسي (Ctrl)
+class LpHandler extends BaseAudioHandler with SeekHandler {
+  LpHandler() {
+    final pl = Ctrl.player;
+    pl.playbackEventStream.listen((_) => _broadcast(),
+        onError: (Object e, StackTrace st) {});
+    pl.playingStream.listen((_) => _broadcast());
+    pl.durationStream.listen((d) {
+      final m = mediaItem.value;
+      if (m != null && d != null && m.duration != d) {
+        mediaItem.add(m.copyWith(duration: d));
+      }
+    });
+    Ctrl.current.addListener(_syncItem);
+    _syncItem();
+  }
+
+  void _syncItem() {
+    final s = Ctrl.current.value;
+    if (s == null) return;
+    final artist = cleanArtist(s.artist);
+    mediaItem.add(MediaItem(
+      id: '${s.id}',
+      title: s.title,
+      artist: artist.isEmpty ? null : artist,
+      album: s.album,
+      duration: s.duration != null ? Duration(milliseconds: s.duration!) : null,
+    ));
+  }
+
+  void _broadcast() {
+    final pl = Ctrl.player;
+    final playing = pl.playing;
+    playbackState.add(PlaybackState(
+      controls: [
+        MediaControl.skipToPrevious,
+        playing ? MediaControl.pause : MediaControl.play,
+        MediaControl.skipToNext,
+      ],
+      systemActions: const {MediaAction.seek},
+      androidCompactActionIndices: const [0, 1, 2],
+      processingState: const {
+        ProcessingState.idle: AudioProcessingState.idle,
+        ProcessingState.loading: AudioProcessingState.loading,
+        ProcessingState.buffering: AudioProcessingState.buffering,
+        ProcessingState.ready: AudioProcessingState.ready,
+        ProcessingState.completed: AudioProcessingState.completed,
+      }[pl.processingState]!,
+      playing: playing,
+      updatePosition: pl.position,
+      bufferedPosition: pl.bufferedPosition,
+      speed: pl.speed,
+    ));
+  }
+
+  @override
+  Future<void> play() => Ctrl.player.play();
+
+  @override
+  Future<void> pause() => Ctrl.player.pause();
+
+  @override
+  Future<void> seek(Duration position) => Ctrl.player.seek(position);
+
+  @override
+  Future<void> skipToNext() => Ctrl.next();
+
+  @override
+  Future<void> skipToPrevious() => Ctrl.prev();
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await JustAudioBackground.init(
-    androidNotificationChannelId: 'com.lyricplayer.audio',
-    androidNotificationChannelName: 'تشغيل الموسيقى',
-    androidNotificationOngoing: true,
+  await AudioService.init(
+    builder: () => LpHandler(),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId: 'com.lyricplayer.audio',
+      androidNotificationChannelName: 'تشغيل الموسيقى',
+      androidNotificationOngoing: true,
+    ),
   );
   await Ctrl.loadPrefs();
   Ctrl.init();
@@ -1318,69 +1403,6 @@ class _HomeState extends State<Home> {
     });
   }
 
-  /// تقرير تشخيص: صلاحية الإشعارات + سبب إغلاق التطبيق آخر مرة + سجل النظام الخاص بالتطبيق
-  Future<void> _diagnose() async {
-    final b = StringBuffer();
-    try {
-      b.writeln('notification permission: ${await Permission.notification.status}');
-    } catch (e) {
-      b.writeln('notification permission error: $e');
-    }
-    try {
-      b.writeln(
-          'battery optimization ignored: ${await Permission.ignoreBatteryOptimizations.status}');
-    } catch (e) {
-      b.writeln('battery error: $e');
-    }
-    try {
-      b.writeln(await _openCh.invokeMethod('diag'));
-    } catch (e) {
-      b.writeln('native diag error: $e');
-    }
-    try {
-      final res = await Process.run('logcat', ['-d', '-t', '6000']);
-      final lvl = RegExp(r'^\S+\s+\S+\s+\d+\s+\d+\s+([EW])\s');
-      final tag = RegExp(
-          'ExoPlayer|AudioService|MediaSession|MediaBrowser|Foreground|Notification|Media3|ActivityManager|AndroidRuntime|FATAL',
-          caseSensitive: false);
-      final noise = RegExp(
-          'BLASTBufferQueue|SurfaceComposerClient|InsetsSource|InsetsController|ImeTracker|VRI\\[|nativeloader|vulkan|AdrenoVK|GraphicsEnvironment|WindowLayoutComponent|SurfaceView|Surface ');
-      final lines = res.stdout
-          .toString()
-          .split('\n')
-          .where((l) => !noise.hasMatch(l) && (lvl.hasMatch(l) || tag.hasMatch(l)))
-          .toList();
-      final tail = lines.length > 220 ? lines.sublist(lines.length - 220) : lines;
-      b.writeln('--- logcat (${tail.length}) ---');
-      b.writeln(tail.join('\n'));
-    } catch (e) {
-      b.writeln('logcat error: $e');
-    }
-    if (!mounted) return;
-    final text = b.toString();
-    await showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('تشخيص'),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: SingleChildScrollView(
-            child: SelectableText(text,
-                textDirection: TextDirection.ltr,
-                style: const TextStyle(fontSize: 11)),
-          ),
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Clipboard.setData(ClipboardData(text: text)),
-              child: const Text('نسخ')),
-          TextButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text('إغلاق')),
-        ],
-      ),
-    );
-  }
-
   Future<void> _handleOpen() async {
     final info = _pendingOpen;
     if (info == null || !_ready || !mounted) return;
@@ -1935,9 +1957,6 @@ class _HomeState extends State<Home> {
                   case 'import':
                     _import();
                     break;
-                  case 'diag':
-                    _diagnose();
-                    break;
                 }
               },
               itemBuilder: (c) => const [
@@ -1948,7 +1967,6 @@ class _HomeState extends State<Home> {
                 PopupMenuItem(
                     value: 'export', child: Text('تصدير الكلمات (نسخة احتياطية)')),
                 PopupMenuItem(value: 'import', child: Text('استيراد الكلمات')),
-                PopupMenuItem(value: 'diag', child: Text('تشخيص (للمطوّر)')),
               ],
             ),
           ],
