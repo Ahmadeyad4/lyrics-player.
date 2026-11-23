@@ -114,7 +114,7 @@ jobs:
             done
           done
 
-      - run: flutter build apk --release
+      - run: flutter build apk --release --no-shrink
 
       - name: Check merged manifest
         run: |
