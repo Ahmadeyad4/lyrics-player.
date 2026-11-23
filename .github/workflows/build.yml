@@ -234,6 +234,17 @@ jobs:
           EOF
           cat "$F"
 
+      - name: Keep audio_service icons (resource shrinker strips them)
+        run: |
+          mkdir -p android/app/src/main/res/raw
+          cat > android/app/src/main/res/raw/keep.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources xmlns:tools="http://schemas.android.com/tools"
+              tools:shrinkMode="lax"
+              tools:keep="@drawable/audio_service_*,@mipmap/ic_launcher" />
+          EOF
+          cat android/app/src/main/res/raw/keep.xml
+
       - name: Relax Kotlin JVM target check
         run: printf '\nkotlin.jvm.target.validation.mode=warning\n' >> android/gradle.properties
 
