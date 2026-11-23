@@ -116,6 +116,12 @@ jobs:
 
       - run: flutter build apk --release
 
+      - name: Check merged manifest
+        run: |
+          M=$(find build/app/intermediates -name AndroidManifest.xml -path '*merged_manifests/release*' | head -1)
+          echo "merged manifest: $M"
+          grep -n -i "audioservice\|FOREGROUND\|POST_NOTIFICATIONS\|MEDIA_BUTTON\|android:icon\|MainActivity" "$M" || true
+
       - uses: actions/upload-artifact@v4
         with:
           name: lyrics-player-apk
