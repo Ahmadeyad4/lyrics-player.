@@ -76,10 +76,67 @@ jobs:
           sed -i 's|</activity>|<intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="content"/><data android:scheme="file"/><data android:mimeType="audio/*"/><data android:mimeType="application/ogg"/></intent-filter>\n        </activity>|' $M
           grep -n "mimeType" $M
 
-      - name: Use AudioServiceActivity
+      - name: Custom MainActivity (audio service + open-with)
         run: |
           F=$(find android/app/src/main -name 'MainActivity.*' | head -1)
-          sed -i 's|io.flutter.embedding.android.FlutterActivity|com.ryanheise.audioservice.AudioServiceActivity|; s|FlutterActivity()|AudioServiceActivity()|' "$F"
+          PKG=$(grep -m1 '^package ' "$F")
+          echo "$PKG" > "$F"
+          cat >> "$F" <<'EOF'
+
+          import android.content.Intent
+          import android.provider.OpenableColumns
+          import com.ryanheise.audioservice.AudioServiceActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : AudioServiceActivity() {
+              private var channel: MethodChannel? = null
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "lyricplayer/open")
+                  ch.setMethodCallHandler { call, result ->
+                      if (call.method == "initial") {
+                          result.success(describe(intent))
+                      } else {
+                          result.notImplemented()
+                      }
+                  }
+                  channel = ch
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  val d = describe(intent)
+                  if (d != null) channel?.invokeMethod("opened", d)
+              }
+
+              private fun describe(i: Intent?): Map<String, Any?>? {
+                  if (i == null || i.action != Intent.ACTION_VIEW) return null
+                  val data = i.data ?: return null
+                  i.action = Intent.ACTION_MAIN
+                  var name: String? = null
+                  var size: Long? = null
+                  try {
+                      contentResolver.query(data, null, null, null, null)?.use { c ->
+                          if (c.moveToFirst()) {
+                              val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                              val si = c.getColumnIndex(OpenableColumns.SIZE)
+                              if (ni >= 0) name = c.getString(ni)
+                              if (si >= 0 && !c.isNull(si)) size = c.getLong(si)
+                          }
+                      }
+                  } catch (e: Exception) {
+                  }
+                  return mapOf(
+                      "uri" to data.toString(),
+                      "name" to (name ?: data.lastPathSegment),
+                      "size" to size
+                  )
+              }
+          }
+          EOF
           cat "$F"
 
       - name: Relax Kotlin JVM target check
