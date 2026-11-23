@@ -138,6 +138,7 @@ jobs:
                   )
               }
 
+              @Suppress("DEPRECATION")
               private fun diag(): String {
                   val sb = StringBuilder()
                   sb.append("device: ").append(android.os.Build.MANUFACTURER).append(" ")
@@ -190,6 +191,42 @@ jobs:
                       }
                   } catch (e: Throwable) {
                       sb.append("exit reasons error: ").append(e.toString()).append("\n")
+                  }
+                  try {
+                      val ci = android.content.ComponentName(packageName, "com.ryanheise.audioservice.AudioService")
+                      val si = packageManager.getServiceInfo(ci, 0)
+                      sb.append("audio service declared: exported=").append(si.exported)
+                      if (android.os.Build.VERSION.SDK_INT >= 29) {
+                          sb.append(" fgsType=").append(si.foregroundServiceType)
+                      }
+                      sb.append("\n")
+                  } catch (e: Throwable) {
+                      sb.append("audio service declared: NO ").append(e.toString()).append("\n")
+                  }
+                  try {
+                      val pi = packageManager.getPackageInfo(packageName, android.content.pm.PackageManager.GET_PERMISSIONS)
+                      val perms = pi.requestedPermissions
+                      if (perms != null) {
+                          for (perm in perms) {
+                              if (perm.contains("FOREGROUND") || perm.contains("NOTIFICATION") || perm.contains("WAKE")) {
+                                  sb.append("perm: ").append(perm).append("\n")
+                              }
+                          }
+                      }
+                  } catch (e: Throwable) {
+                      sb.append("perm list error: ").append(e.toString()).append("\n")
+                  }
+                  try {
+                      val am2 = getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                      var count = 0
+                      for (s in am2.getRunningServices(100)) {
+                          count++
+                          sb.append("running service: ").append(s.service.className)
+                              .append(" foreground=").append(s.foreground).append("\n")
+                      }
+                      if (count == 0) sb.append("running services: none\n")
+                  } catch (e: Throwable) {
+                      sb.append("running services error: ").append(e.toString()).append("\n")
                   }
                   return sb.toString()
               }
