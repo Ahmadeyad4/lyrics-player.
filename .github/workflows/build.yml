@@ -98,8 +98,6 @@ jobs:
                   ch.setMethodCallHandler { call, result ->
                       if (call.method == "initial") {
                           result.success(describe(intent))
-                      } else if (call.method == "diag") {
-                          result.success(diag())
                       } else {
                           result.notImplemented()
                       }
@@ -136,99 +134,6 @@ jobs:
                       "name" to (name ?: data.lastPathSegment),
                       "size" to size
                   )
-              }
-
-              @Suppress("DEPRECATION")
-              private fun diag(): String {
-                  val sb = StringBuilder()
-                  sb.append("device: ").append(android.os.Build.MANUFACTURER).append(" ")
-                      .append(android.os.Build.MODEL).append(" / sdk ")
-                      .append(android.os.Build.VERSION.SDK_INT).append("\n")
-                  try {
-                      val nm = getSystemService(android.content.Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-                      sb.append("notifications enabled: ").append(nm.areNotificationsEnabled()).append("\n")
-                      if (android.os.Build.VERSION.SDK_INT >= 26) {
-                          for (c in nm.notificationChannels) {
-                              sb.append("channel ").append(c.id).append(" importance=")
-                                  .append(c.importance).append("\n")
-                          }
-                      }
-                      for (n in nm.activeNotifications) {
-                          sb.append("active notification id=").append(n.id).append("\n")
-                      }
-                  } catch (e: Throwable) {
-                      sb.append("notification info error: ").append(e.toString()).append("\n")
-                  }
-                  try {
-                      if (android.os.Build.VERSION.SDK_INT >= 30) {
-                          val am = getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-                          for (e in am.getHistoricalProcessExitReasons(packageName, 0, 8)) {
-                              val name = when (e.reason) {
-                                  1 -> "EXIT_SELF"
-                                  2 -> "SIGNALED"
-                                  3 -> "LOW_MEMORY"
-                                  4 -> "CRASH"
-                                  5 -> "CRASH_NATIVE"
-                                  6 -> "ANR"
-                                  7 -> "INITIALIZATION_FAILURE"
-                                  8 -> "PERMISSION_CHANGE"
-                                  9 -> "EXCESSIVE_RESOURCE_USAGE"
-                                  10 -> "USER_REQUESTED"
-                                  11 -> "USER_STOPPED"
-                                  12 -> "DEPENDENCY_DIED"
-                                  13 -> "OTHER"
-                                  14 -> "FREEZER"
-                                  15 -> "PACKAGE_STATE_CHANGE"
-                                  16 -> "PACKAGE_UPDATED"
-                                  else -> "UNKNOWN"
-                              }
-                              sb.append("exit: ").append(java.util.Date(e.timestamp).toString())
-                                  .append(" reason=").append(name)
-                                  .append(" status=").append(e.status)
-                                  .append(" importance=").append(e.importance)
-                                  .append(" desc=").append(e.description).append("\n")
-                          }
-                      }
-                  } catch (e: Throwable) {
-                      sb.append("exit reasons error: ").append(e.toString()).append("\n")
-                  }
-                  try {
-                      val ci = android.content.ComponentName(packageName, "com.ryanheise.audioservice.AudioService")
-                      val si = packageManager.getServiceInfo(ci, 0)
-                      sb.append("audio service declared: exported=").append(si.exported)
-                      if (android.os.Build.VERSION.SDK_INT >= 29) {
-                          sb.append(" fgsType=").append(si.foregroundServiceType)
-                      }
-                      sb.append("\n")
-                  } catch (e: Throwable) {
-                      sb.append("audio service declared: NO ").append(e.toString()).append("\n")
-                  }
-                  try {
-                      val pi = packageManager.getPackageInfo(packageName, android.content.pm.PackageManager.GET_PERMISSIONS)
-                      val perms = pi.requestedPermissions
-                      if (perms != null) {
-                          for (perm in perms) {
-                              if (perm.contains("FOREGROUND") || perm.contains("NOTIFICATION") || perm.contains("WAKE")) {
-                                  sb.append("perm: ").append(perm).append("\n")
-                              }
-                          }
-                      }
-                  } catch (e: Throwable) {
-                      sb.append("perm list error: ").append(e.toString()).append("\n")
-                  }
-                  try {
-                      val am2 = getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
-                      var count = 0
-                      for (s in am2.getRunningServices(100)) {
-                          count++
-                          sb.append("running service: ").append(s.service.className)
-                              .append(" foreground=").append(s.foreground).append("\n")
-                      }
-                      if (count == 0) sb.append("running services: none\n")
-                  } catch (e: Throwable) {
-                      sb.append("running services error: ").append(e.toString()).append("\n")
-                  }
-                  return sb.toString()
               }
           }
           EOF
