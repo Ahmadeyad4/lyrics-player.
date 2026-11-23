@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show File;
+import 'dart:io' show File, Process;
 import 'dart:math' show Random;
 import 'dart:typed_data';
 import 'dart:ui' show ImageFilter;
@@ -1318,6 +1318,62 @@ class _HomeState extends State<Home> {
     });
   }
 
+  /// تقرير تشخيص: صلاحية الإشعارات + سبب إغلاق التطبيق آخر مرة + سجل النظام الخاص بالتطبيق
+  Future<void> _diagnose() async {
+    final b = StringBuffer();
+    try {
+      b.writeln('notification permission: ${await Permission.notification.status}');
+    } catch (e) {
+      b.writeln('notification permission error: $e');
+    }
+    try {
+      b.writeln(
+          'battery optimization ignored: ${await Permission.ignoreBatteryOptimizations.status}');
+    } catch (e) {
+      b.writeln('battery error: $e');
+    }
+    try {
+      b.writeln(await _openCh.invokeMethod('diag'));
+    } catch (e) {
+      b.writeln('native diag error: $e');
+    }
+    try {
+      final res = await Process.run('logcat', ['-d', '-t', '3000']);
+      final re = RegExp(
+          'AudioService|MediaSession|Foreground|AndroidRuntime|FATAL|lyricplayer|just_audio|ExoPlayer|flutter',
+          caseSensitive: false);
+      final lines = res.stdout.toString().split('\n').where(re.hasMatch).toList();
+      final tail = lines.length > 150 ? lines.sublist(lines.length - 150) : lines;
+      b.writeln('--- logcat (${tail.length}) ---');
+      b.writeln(tail.join('\n'));
+    } catch (e) {
+      b.writeln('logcat error: $e');
+    }
+    if (!mounted) return;
+    final text = b.toString();
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('تشخيص'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: SelectableText(text,
+                textDirection: TextDirection.ltr,
+                style: const TextStyle(fontSize: 11)),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Clipboard.setData(ClipboardData(text: text)),
+              child: const Text('نسخ')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('إغلاق')),
+        ],
+      ),
+    );
+  }
+
   Future<void> _handleOpen() async {
     final info = _pendingOpen;
     if (info == null || !_ready || !mounted) return;
@@ -1872,6 +1928,9 @@ class _HomeState extends State<Home> {
                   case 'import':
                     _import();
                     break;
+                  case 'diag':
+                    _diagnose();
+                    break;
                 }
               },
               itemBuilder: (c) => const [
@@ -1882,6 +1941,7 @@ class _HomeState extends State<Home> {
                 PopupMenuItem(
                     value: 'export', child: Text('تصدير الكلمات (نسخة احتياطية)')),
                 PopupMenuItem(value: 'import', child: Text('استيراد الكلمات')),
+                PopupMenuItem(value: 'diag', child: Text('تشخيص (للمطوّر)')),
               ],
             ),
           ],
