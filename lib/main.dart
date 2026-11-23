@@ -1338,12 +1338,19 @@ class _HomeState extends State<Home> {
       b.writeln('native diag error: $e');
     }
     try {
-      final res = await Process.run('logcat', ['-d', '-t', '3000']);
-      final re = RegExp(
-          'AudioService|MediaSession|Foreground|AndroidRuntime|FATAL|lyricplayer|just_audio|ExoPlayer|flutter',
+      final res = await Process.run('logcat', ['-d', '-t', '6000']);
+      final lvl = RegExp(r'^\S+\s+\S+\s+\d+\s+\d+\s+([EW])\s');
+      final tag = RegExp(
+          'ExoPlayer|AudioService|MediaSession|MediaBrowser|Foreground|Notification|Media3|ActivityManager|AndroidRuntime|FATAL',
           caseSensitive: false);
-      final lines = res.stdout.toString().split('\n').where(re.hasMatch).toList();
-      final tail = lines.length > 150 ? lines.sublist(lines.length - 150) : lines;
+      final noise = RegExp(
+          'BLASTBufferQueue|SurfaceComposerClient|InsetsSource|InsetsController|ImeTracker|VRI\\[|nativeloader|vulkan|AdrenoVK|GraphicsEnvironment|WindowLayoutComponent|SurfaceView|Surface ');
+      final lines = res.stdout
+          .toString()
+          .split('\n')
+          .where((l) => !noise.hasMatch(l) && (lvl.hasMatch(l) || tag.hasMatch(l)))
+          .toList();
+      final tail = lines.length > 220 ? lines.sublist(lines.length - 220) : lines;
       b.writeln('--- logcat (${tail.length}) ---');
       b.writeln(tail.join('\n'));
     } catch (e) {
