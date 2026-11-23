@@ -1246,10 +1246,90 @@ class _HomeState extends State<Home> {
   String lyricsFilter = 'all'; // all | none | has
   String sort = 'title'; // title | artist | recent
 
+  // فتح ملف صوتي من برّا التطبيق (فتح باستخدام / مدير الملفات)
+  static const _openCh = MethodChannel('lyricplayer/open');
+  Map? _pendingOpen;
+  bool _ready = false;
+
   @override
   void initState() {
     super.initState();
-    _load();
+    _openCh.setMethodCallHandler(_onOpenCall);
+    _load().then((_) => _checkOpenIntent());
+  }
+
+  Future<void> _onOpenCall(MethodCall call) async {
+    if (call.method == 'opened' && call.arguments is Map) {
+      _pendingOpen = Map.from(call.arguments as Map);
+      await _handleOpen();
+    }
+  }
+
+  Future<void> _checkOpenIntent() async {
+    try {
+      final r = await _openCh.invokeMethod('initial');
+      if (r is Map) _pendingOpen = Map.from(r);
+    } catch (_) {}
+    await _handleOpen();
+  }
+
+  /// يدوّر على الأغنية بالمكتبة (حتى تشتغل الكلمات)، وإذا ما لقاها يسوي أغنية مؤقتة
+  SongModel _songForOpen(Map info) {
+    final uri = (info['uri'] ?? '').toString();
+    final name = info['name']?.toString();
+    final size = info['size'] is int ? info['size'] as int : null;
+
+    final mid = RegExp(r'/audio/media/(\d+)').firstMatch(uri);
+    if (mid != null) {
+      final id = int.parse(mid.group(1)!);
+      for (final s in rawSongs) {
+        if (s.id == id) return s;
+      }
+    }
+    String? path;
+    if (uri.startsWith('file://')) {
+      path = Uri.decodeComponent(uri.substring(7));
+      for (final s in rawSongs) {
+        if (s.data == path) return s;
+      }
+    }
+    if (name != null) {
+      for (final s in rawSongs) {
+        if (s.displayName == name && (size == null || s.size == size)) {
+          return s;
+        }
+      }
+    }
+    final base = name == null ? 'ملف صوتي' : p.basenameWithoutExtension(name);
+    return SongModel({
+      '_id': -(uri.hashCode.abs() + 1),
+      '_data': path ?? uri,
+      '_uri': uri,
+      '_display_name': name ?? base,
+      '_display_name_wo_ext': base,
+      'title': base,
+      '_size': size ?? 0,
+      'duration': null,
+      'artist': '<unknown>',
+      'album': '<unknown>',
+      'album_id': 0,
+      'artist_id': 0,
+      'file_extension': '',
+    });
+  }
+
+  Future<void> _handleOpen() async {
+    final info = _pendingOpen;
+    if (info == null || !_ready || !mounted) return;
+    _pendingOpen = null;
+    final song = _songForOpen(info);
+    final i = songs.indexWhere((e) => e.id == song.id);
+    Navigator.of(context).popUntil((r) => r.isFirst);
+    if (i >= 0) {
+      await _playFrom(songs, i);
+    } else {
+      await _playFrom([song], 0);
+    }
   }
 
   Future<void> _load() async {
@@ -1283,6 +1363,8 @@ class _HomeState extends State<Home> {
     lists = await Db.playlists();
     await Ctrl.restore(songs);
     if (mounted) setState(() => loading = false);
+    _ready = true;
+    _handleOpen();
   }
 
   void _applySort() {
