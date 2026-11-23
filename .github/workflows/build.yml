@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-apk
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,12 +37,28 @@ jobs:
           cp -r /tmp/lib_bak lib
           cp /tmp/pubspec_bak.yaml pubspec.yaml
 
+      - name: App icon
+        run: |
+          set +e
+          if [ -f icon.png ]; then
+            R=android/app/src/main/res
+            rm -rf $R/mipmap-anydpi* $R/mipmap-*/ic_launcher.*
+            for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+              d=${pair%%:*}; sz=${pair##*:}
+              mkdir -p $R/mipmap-$d
+              convert icon.png -resize ${sz}x${sz} $R/mipmap-$d/ic_launcher.png
+            done
+            ls $R/mipmap-*
+          else
+            echo "no icon.png, using default icon"
+          fi
+
       - name: Android permissions, audio service and app name
         run: |
           M=android/app/src/main/AndroidManifest.xml
           sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <application|' $M
           sed -i 's|</application>|<service android:name="com.ryanheise.audioservice.AudioService" android:foregroundServiceType="mediaPlayback" android:exported="true"><intent-filter><action android:name="android.media.browse.MediaBrowserService"/></intent-filter></service>\n        <receiver android:name="com.ryanheise.audioservice.MediaButtonReceiver" android:exported="true"><intent-filter><action android:name="android.intent.action.MEDIA_BUTTON"/></intent-filter></receiver>\n    </application>|' $M
-          sed -i 's|android:label="[^"]*"|android:label="Lyrics Player"|' $M
+          sed -i 's|android:label="[^"]*"|android:label="مشغل الكلمات"|' $M
           cat $M
 
       - name: Use AudioServiceActivity
