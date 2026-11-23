@@ -39,24 +39,33 @@ jobs:
 
       - name: App icon
         run: |
-          set +e
-          if [ -f icon.png ]; then
-            R=android/app/src/main/res
+          R=android/app/src/main/res
+          mkdir -p /tmp/icons
+          ok=1
+          [ -f icon.png ] || ok=0
+          for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            d=${pair%%:*}; sz=${pair##*:}
+            mkdir -p /tmp/icons/mipmap-$d
+            if command -v magick >/dev/null 2>&1; then
+              magick icon.png -resize ${sz}x${sz} /tmp/icons/mipmap-$d/ic_launcher.png || ok=0
+            elif command -v convert >/dev/null 2>&1; then
+              convert icon.png -resize ${sz}x${sz} /tmp/icons/mipmap-$d/ic_launcher.png || ok=0
+            else
+              python3 -m pip install --quiet --break-system-packages pillow && python3 -c "from PIL import Image; Image.open('icon.png').convert('RGB').resize(($sz,$sz), Image.LANCZOS).save('/tmp/icons/mipmap-$d/ic_launcher.png')" || ok=0
+            fi
+          done
+          if [ "$ok" = "1" ] && [ -f /tmp/icons/mipmap-xxxhdpi/ic_launcher.png ]; then
             rm -rf $R/mipmap-anydpi* $R/mipmap-*/ic_launcher.*
-            for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
-              d=${pair%%:*}; sz=${pair##*:}
-              mkdir -p $R/mipmap-$d
-              convert icon.png -resize ${sz}x${sz} $R/mipmap-$d/ic_launcher.png
-            done
-            ls $R/mipmap-*
+            cp -r /tmp/icons/* $R/
+            echo "icon installed"
           else
-            echo "no icon.png, using default icon"
+            echo "icon skipped, default icon kept"
           fi
 
       - name: Android permissions, audio service and app name
         run: |
           M=android/app/src/main/AndroidManifest.xml
-          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <application|' $M
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <application|' $M
           sed -i 's|</application>|<service android:name="com.ryanheise.audioservice.AudioService" android:foregroundServiceType="mediaPlayback" android:exported="true"><intent-filter><action android:name="android.media.browse.MediaBrowserService"/></intent-filter></service>\n        <receiver android:name="com.ryanheise.audioservice.MediaButtonReceiver" android:exported="true"><intent-filter><action android:name="android.intent.action.MEDIA_BUTTON"/></intent-filter></receiver>\n    </application>|' $M
           sed -i 's|android:label="[^"]*"|android:label="مشغل الكلمات"|' $M
           cat $M
