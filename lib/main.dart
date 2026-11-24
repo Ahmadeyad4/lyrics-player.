@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show File;
+import 'dart:io' show Directory, File, FileSystemException;
 import 'dart:math' show Random;
 import 'dart:typed_data';
 import 'dart:ui' show ImageFilter;
@@ -71,6 +71,12 @@ class Lyrics {
 }
 
 /// تخزين الكلمات داخل الهاتف
+/// يرتفع رقمه لما تتغير المكتبة (مثلاً بعد نقل أغنية) حتى الرئيسية تعيد القراءة
+final libraryVersion = ValueNotifier<int>(0);
+
+/// نفس القناة اللي يستعملها MainActivity (فتح الملفات + مسح الميديا)
+const _nativeCh = MethodChannel('lyricplayer/open');
+
 class Db {
   static Database? _db;
 
@@ -136,6 +142,32 @@ class Db {
     await d.delete('playlist_songs', where: 'song_id=?', whereArgs: [id]);
     await d.delete('kv', where: 'k=?', whereArgs: ['off_$id']);
     await hide(id);
+  }
+
+  /// بعد نقل الملف يتغير رقم الأغنية بالمكتبة، فننقل الكلمات والترجمة والمفضلة والقوائم للرقم الجديد
+  static Future<void> moveId(int from, int to) async {
+    if (from == to) return;
+    final d = await _d;
+    await d.transaction((t) async {
+      final wasHidden =
+          (await t.query('hidden', where: 'song_id=?', whereArgs: [from])).isNotEmpty;
+      for (final tb in ['lyrics', 'translations', 'favorites', 'playlist_songs']) {
+        await t.rawUpdate('UPDATE OR REPLACE $tb SET song_id=? WHERE song_id=?', [to, from]);
+      }
+      final off = await t.query('kv', where: 'k=?', whereArgs: ['off_$from']);
+      if (off.isNotEmpty) {
+        await t.insert('kv', {'k': 'off_$to', 'v': off.first['v']},
+            conflictAlgorithm: ConflictAlgorithm.replace);
+        await t.delete('kv', where: 'k=?', whereArgs: ['off_$from']);
+      }
+      if (wasHidden) {
+        await t.insert('hidden', {'song_id': to},
+            conflictAlgorithm: ConflictAlgorithm.ignore);
+      }
+      // الرقم القديم يبقى مخفي حتى ما يطلع نسخة وهمية إذا المكتبة لسا تذكره
+      await t.insert('hidden', {'song_id': from},
+          conflictAlgorithm: ConflictAlgorithm.ignore);
+    });
   }
 
   // ---- المفضلة ----
@@ -881,6 +913,171 @@ Future<bool> deleteForever(BuildContext context, SongModel s) async {
   return true;
 }
 
+/// اختيار المجلد الوجهة: مجلدات موجودة بالمكتبة، أو مجلد جديد، أو أي مجلد من الهاتف
+Future<String?> pickTargetFolder(BuildContext context, String currentDir) async {
+  final dirs = <String>{};
+  try {
+    final all = await OnAudioQuery().querySongs(uriType: UriType.EXTERNAL);
+    for (final e in all) {
+      final d = _dirOf(e);
+      if (d.isNotEmpty) dirs.add(d);
+    }
+  } catch (_) {}
+  dirs.remove(currentDir);
+  final list = dirs.toList()
+    ..sort((a, b) => _lastSeg(a).toLowerCase().compareTo(_lastSeg(b).toLowerCase()));
+  if (!context.mounted) return null;
+  return showModalBottomSheet<String>(
+    context: context,
+    backgroundColor: surface,
+    isScrollControlled: true,
+    builder: (ctx) => SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: MediaQuery.of(ctx).size.height * 0.75),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const ListTile(
+              title: Text('نقل الأغنية إلى...',
+                  style: TextStyle(fontWeight: FontWeight.bold))),
+          ListTile(
+            leading: const Icon(Icons.create_new_folder_outlined),
+            title: const Text('مجلد جديد...'),
+            onTap: () async {
+              final n = await askName(ctx, 'اسم المجلد الجديد');
+              if (n == null || n.isEmpty || !ctx.mounted) return;
+              final i = currentDir.lastIndexOf('/');
+              final parent = i > 0 ? currentDir.substring(0, i) : '/storage/emulated/0';
+              Navigator.pop(ctx, '$parent/${n.replaceAll('/', '_')}');
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.folder_open),
+            title: const Text('اختيار مجلد من الهاتف...'),
+            onTap: () async {
+              final d = await FilePicker.platform.getDirectoryPath();
+              if (d == null || !ctx.mounted) return;
+              Navigator.pop(ctx, d);
+            },
+          ),
+          const Divider(height: 1),
+          Flexible(
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: list.length,
+              itemBuilder: (c, i) => ListTile(
+                leading: const Icon(Icons.folder_outlined),
+                title: Text(_lastSeg(list[i]),
+                    maxLines: 1, overflow: TextOverflow.ellipsis),
+                subtitle: Text(_parentSeg(list[i]) ?? '',
+                    textDirection: TextDirection.ltr,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: muted, fontSize: 12)),
+                onTap: () => Navigator.pop(ctx, list[i]),
+              ),
+            ),
+          ),
+        ]),
+      ),
+    ),
+  );
+}
+
+/// ينقل ملف الأغنية لمجلد ثاني، ويحدّث مكتبة الهاتف، وينقل الكلمات للرقم الجديد
+Future<bool> moveSong(BuildContext context, SongModel s) async {
+  void toast(String t) {
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+    }
+  }
+
+  var st = await Permission.manageExternalStorage.status;
+  if (!st.isGranted) st = await Permission.manageExternalStorage.request();
+  if (!st.isGranted) {
+    toast('لازم تفعّل صلاحية "الوصول لكل الملفات" للتطبيق من الإعدادات حتى يكدر ينقل الملف.');
+    return false;
+  }
+  if (!context.mounted) return false;
+
+  final from = s.data;
+  final srcDir = _dirOf(s);
+  final destDir = await pickTargetFolder(context, srcDir);
+  if (destDir == null || destDir == srcDir || !context.mounted) return false;
+
+  final dest = '$destDir/${p.basename(from)}';
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('نقل الأغنية؟'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(s.title, style: const TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          const Text('إلى:', style: TextStyle(color: muted)),
+          Text(destDir,
+              textDirection: TextDirection.ltr,
+              style: const TextStyle(fontSize: 13)),
+        ],
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
+        FilledButton(
+            onPressed: () => Navigator.pop(ctx, true), child: const Text('نقل')),
+      ],
+    ),
+  );
+  if (ok != true) return false;
+
+  try {
+    await Directory(destDir).create(recursive: true);
+    if (await File(dest).exists()) {
+      toast('يوجد ملف بنفس الاسم بالمجلد الوجهة');
+      return false;
+    }
+    try {
+      await File(from).rename(dest);
+    } on FileSystemException {
+      // مجلدين على وحدتين تخزين مختلفتين: ننسخ ثم نحذف الأصل
+      await File(from).copy(dest);
+      if (await File(dest).length() != await File(from).length()) {
+        await File(dest).delete();
+        throw Exception('copy mismatch');
+      }
+      await File(from).delete();
+    }
+  } catch (_) {
+    toast('تعذّر نقل الملف');
+    return false;
+  }
+
+  await Ctrl.forget(s.id);
+  int? newId;
+  try {
+    await _nativeCh
+        .invokeMethod('scan', {'paths': [from, dest]})
+        .timeout(const Duration(seconds: 8));
+    final all = await OnAudioQuery().querySongs(uriType: UriType.EXTERNAL);
+    for (final e in all) {
+      if (e.data == dest) {
+        newId = e.id;
+        break;
+      }
+    }
+  } catch (_) {}
+  if (newId != null) {
+    await Db.moveId(s.id, newId);
+  } else {
+    await Db.hide(s.id);
+  }
+  libraryVersion.value++;
+  toast(newId != null
+      ? 'انتقلت الأغنية إلى ${_lastSeg(destDir)}'
+      : 'انتقل الملف، وراح يظهر بالمكتبة بعد ما يتحدّث الهاتف');
+  return true;
+}
+
 /// قائمة خيارات الأغنية (ضغطة مطوّلة)
 Future<void> showSongMenu(BuildContext context, SongModel s,
     {int? playlistId, VoidCallback? onChanged}) async {
@@ -926,6 +1123,15 @@ Future<void> showSongMenu(BuildContext context, SongModel s,
               onChanged?.call();
             },
           ),
+        ListTile(
+          leading: const Icon(Icons.drive_file_move_outline),
+          title: const Text('نقل إلى مجلد آخر'),
+          onTap: () async {
+            Navigator.pop(ctx);
+            final done = await moveSong(context, s);
+            if (done) onChanged?.call();
+          },
+        ),
         ListTile(
           leading: const Icon(Icons.visibility_off_outlined),
           title: const Text('إخفاء من التطبيق'),
@@ -1340,7 +1546,30 @@ class _HomeState extends State<Home> {
   void initState() {
     super.initState();
     _openCh.setMethodCallHandler(_onOpenCall);
+    libraryVersion.addListener(_onLibrary);
     _load().then((_) => _checkOpenIntent());
+  }
+
+  @override
+  void dispose() {
+    libraryVersion.removeListener(_onLibrary);
+    super.dispose();
+  }
+
+  void _onLibrary() => _reloadLibrary();
+
+  /// يعيد قراءة الأغاني من مكتبة الهاتف (بدون شاشة تحميل)
+  Future<void> _reloadLibrary() async {
+    try {
+      final all = await _q.querySongs(
+        sortType: SongSortType.TITLE,
+        orderType: OrderType.ASC_OR_SMALLER,
+        uriType: UriType.EXTERNAL,
+        ignoreCase: true,
+      );
+      rawSongs = all.where((s) => (s.duration ?? 0) > 30000).toList();
+    } catch (_) {}
+    await _refreshMeta();
   }
 
   Future<void> _onOpenCall(MethodCall call) async {
@@ -2122,13 +2351,157 @@ class PlayerPage extends StatelessWidget {
           body: Stack(children: [
             Positioned.fill(child: Backdrop(id: s.id)),
             Column(children: [
-              Expanded(child: LyricsView(key: ValueKey(s.id), song: s)),
+              Expanded(child: _PlayerPager(song: s)),
               const Controls(),
             ]),
           ]),
         );
       },
     );
+  }
+}
+
+/// صفحتين بالسحب (يمين أو يسار): الكلمات، وصورة الغلاف. يتذكر آخر صفحة اخترتها.
+class _PlayerPager extends StatefulWidget {
+  final SongModel song;
+  const _PlayerPager({required this.song});
+  @override
+  State<_PlayerPager> createState() => _PlayerPagerState();
+}
+
+class _PlayerPagerState extends State<_PlayerPager> {
+  PageController? pc;
+  int page = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    Db.getKv('player_page').then((v) {
+      final i = v == '1' ? 1 : 0;
+      if (!mounted) return;
+      setState(() {
+        page = i;
+        // صفحات لا نهائية حتى السحب يشتغل للجهتين
+        pc = PageController(initialPage: 1000 + i);
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    pc?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = pc;
+    if (c == null) return const SizedBox.shrink();
+    final s = widget.song;
+    return Column(children: [
+      Expanded(
+        child: PageView.builder(
+          controller: c,
+          onPageChanged: (k) {
+            final i = k % 2;
+            setState(() => page = i);
+            Db.setKv('player_page', '$i');
+          },
+          itemBuilder: (context, k) => k.isEven
+              ? LyricsView(key: ValueKey('${s.id}_$k'), song: s)
+              : _CoverPage(song: s),
+        ),
+      ),
+      Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+        for (var i = 0; i < 2; i++)
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            margin: const EdgeInsets.symmetric(horizontal: 3, vertical: 6),
+            width: page == i ? 16 : 6,
+            height: 6,
+            decoration: BoxDecoration(
+              color: page == i ? saffron : muted.withOpacity(0.5),
+              borderRadius: BorderRadius.circular(3),
+            ),
+          ),
+      ]),
+    ]);
+  }
+}
+
+/// صفحة صورة الأغنية / الألبوم بحجم كبير
+class _CoverPage extends StatelessWidget {
+  final SongModel song;
+  const _CoverPage({required this.song});
+
+  @override
+  Widget build(BuildContext context) {
+    final artist = cleanArtist(song.artist);
+    final alb = song.album;
+    final sub = [
+      if (artist.isNotEmpty) artist,
+      if (alb != null && alb.isNotEmpty && alb != '<unknown>') alb,
+    ].join(' • ');
+    return LayoutBuilder(builder: (context, c) {
+      var side = c.maxWidth - 56;
+      final maxH = c.maxHeight - 110;
+      if (side > maxH) side = maxH;
+      if (side > 420) side = 420;
+      if (side < 120) side = 120;
+      final r = BorderRadius.circular(22);
+      return Center(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: side,
+            height: side,
+            decoration: BoxDecoration(
+              borderRadius: r,
+              boxShadow: [
+                BoxShadow(
+                    color: Colors.black.withOpacity(0.45),
+                    blurRadius: 28,
+                    offset: const Offset(0, 12)),
+              ],
+            ),
+            child: QueryArtworkWidget(
+              id: song.id,
+              type: ArtworkType.AUDIO,
+              size: 1000,
+              quality: 100,
+              artworkWidth: side,
+              artworkHeight: side,
+              artworkBorder: r,
+              artworkFit: BoxFit.cover,
+              keepOldArtwork: true,
+              nullArtworkWidget: Container(
+                width: side,
+                height: side,
+                decoration: BoxDecoration(color: surface, borderRadius: r),
+                child: Icon(Icons.music_note, color: muted, size: side * 0.4),
+              ),
+            ),
+          ),
+          const SizedBox(height: 22),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 28),
+            child: Text(song.title,
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          ),
+          if (sub.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 6, left: 28, right: 28),
+              child: Text(sub,
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: muted)),
+            ),
+        ]),
+      );
+    });
   }
 }
 
