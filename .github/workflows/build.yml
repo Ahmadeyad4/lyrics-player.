@@ -65,7 +65,7 @@ jobs:
       - name: Android permissions, audio service and app name
         run: |
           M=android/app/src/main/AndroidManifest.xml
-          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <application|' $M
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>\n    <application|' $M
           sed -i 's|</application>|<service android:name="com.ryanheise.audioservice.AudioService" android:foregroundServiceType="mediaPlayback" android:exported="true"><intent-filter><action android:name="android.media.browse.MediaBrowserService"/></intent-filter></service>\n        <receiver android:name="com.ryanheise.audioservice.MediaButtonReceiver" android:exported="true"><intent-filter><action android:name="android.intent.action.MEDIA_BUTTON"/></intent-filter></receiver>\n    </application>|' $M
           sed -i 's|android:label="[^"]*"|android:label="مشغل الكلمات"|' $M
           cat $M
@@ -98,6 +98,12 @@ jobs:
                   ch.setMethodCallHandler { call, result ->
                       if (call.method == "initial") {
                           result.success(describe(intent))
+                      } else if (call.method == "version") {
+                          result.success(versionInfo())
+                      } else if (call.method == "cacheDir") {
+                          result.success(cacheDir.absolutePath)
+                      } else if (call.method == "install") {
+                          result.success(installApk(call.argument<String>("path") ?: ""))
                       } else if (call.method == "scan") {
                           val list = call.argument<List<String>>("paths")
                           val paths = (list ?: emptyList()).toTypedArray()
@@ -126,6 +132,92 @@ jobs:
                   setIntent(intent)
                   val d = describe(intent)
                   if (d != null) channel?.invokeMethod("opened", d)
+              }
+
+              private var installReceiver: android.content.BroadcastReceiver? = null
+
+              @Suppress("DEPRECATION")
+              private fun versionInfo(): Map<String, Any?> {
+                  val pi = packageManager.getPackageInfo(packageName, 0)
+                  val code: Long = if (android.os.Build.VERSION.SDK_INT >= 28) pi.longVersionCode else pi.versionCode.toLong()
+                  return mapOf("name" to pi.versionName, "code" to code)
+              }
+
+              @Suppress("DEPRECATION")
+              private fun installApk(path: String): String {
+                  try {
+                      val file = java.io.File(path)
+                      if (!file.exists()) return "missing"
+                      if (android.os.Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
+                          val i = Intent(
+                              android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                              android.net.Uri.parse("package:" + packageName)
+                          )
+                          startActivity(i)
+                          return "need_permission"
+                      }
+                      val installer = packageManager.packageInstaller
+                      val params = android.content.pm.PackageInstaller.SessionParams(
+                          android.content.pm.PackageInstaller.SessionParams.MODE_FULL_INSTALL
+                      )
+                      val sid = installer.createSession(params)
+                      val session = installer.openSession(sid)
+                      try {
+                          java.io.FileInputStream(file).use { input ->
+                              session.openWrite("update.apk", 0, file.length()).use { out ->
+                                  input.copyTo(out)
+                                  session.fsync(out)
+                              }
+                          }
+                          val action = packageName + ".INSTALL_RESULT"
+                          if (installReceiver == null) {
+                              val r = object : android.content.BroadcastReceiver() {
+                                  override fun onReceive(context: android.content.Context, intent: Intent) {
+                                      val status = intent.getIntExtra(android.content.pm.PackageInstaller.EXTRA_STATUS, -1)
+                                      if (status == android.content.pm.PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                                          val confirm = intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                                          if (confirm != null) {
+                                              confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                              context.startActivity(confirm)
+                                          }
+                                      } else {
+                                          val msg = intent.getStringExtra(android.content.pm.PackageInstaller.EXTRA_STATUS_MESSAGE)
+                                          channel?.invokeMethod("installStatus", mapOf("status" to status, "message" to msg))
+                                      }
+                                  }
+                              }
+                              val filter = android.content.IntentFilter(action)
+                              if (android.os.Build.VERSION.SDK_INT >= 33) {
+                                  registerReceiver(r, filter, android.content.Context.RECEIVER_NOT_EXPORTED)
+                              } else {
+                                  registerReceiver(r, filter)
+                              }
+                              installReceiver = r
+                          }
+                          val pending = android.app.PendingIntent.getBroadcast(
+                              this, sid, Intent(action).setPackage(packageName),
+                              android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_MUTABLE
+                          )
+                          session.commit(pending.intentSender)
+                      } finally {
+                          session.close()
+                      }
+                      return "started"
+                  } catch (e: Throwable) {
+                      return "error:" + e.toString()
+                  }
+              }
+
+              override fun onDestroy() {
+                  val r = installReceiver
+                  if (r != null) {
+                      try {
+                          unregisterReceiver(r)
+                      } catch (e: Exception) {
+                      }
+                      installReceiver = null
+                  }
+                  super.onDestroy()
               }
 
               private fun describe(i: Intent?): Map<String, Any?>? {
@@ -169,10 +261,12 @@ jobs:
       - name: Relax Kotlin JVM target check
         run: printf '\nkotlin.jvm.target.validation.mode=warning\n' >> android/gradle.properties
 
-      - name: Use fixed signing key
+      - name: Use fixed signing key (fallback)
         run: |
-          mkdir -p $HOME/.android
-          cp debug.keystore $HOME/.android/debug.keystore
+          if [ -f debug.keystore ]; then
+            mkdir -p $HOME/.android
+            cp debug.keystore $HOME/.android/debug.keystore
+          fi
 
       - run: flutter pub get
 
@@ -204,7 +298,38 @@ jobs:
             done
           done
 
-      - run: flutter build apk --release --no-shrink
+      - name: Build APK
+        run: flutter build apk --release --no-shrink --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }} --dart-define=GH_REPO=${{ github.repository }}
+
+      # توقيع ثابت بعد البناء: نفس المفتاح كل مرة حتى أندرويد يقبل التحديث فوق القديم
+      - name: Sign APK with fixed key
+        env:
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          if [ ! -f signing/release.jks.enc ]; then
+            echo "no encrypted key in repo: keeping the old signature"
+            exit 0
+          fi
+          if [ -z "$KS_PASS" ]; then
+            echo "::error::signing/release.jks.enc موجود بس سر KEYSTORE_PASSWORD مو مضاف بالمستودع"
+            exit 1
+          fi
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:KS_PASS \
+            -in signing/release.jks.enc -out "$RUNNER_TEMP/release.jks"
+          APKSIGNER=$(ls "${ANDROID_HOME:-$ANDROID_SDK_ROOT}"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" sign \
+            --ks "$RUNNER_TEMP/release.jks" \
+            --ks-pass env:KS_PASS --key-pass env:KS_PASS \
+            --ks-key-alias exam \
+            --out "$RUNNER_TEMP/signed.apk" "$APK"
+          mv "$RUNNER_TEMP/signed.apk" "$APK"
+          rm -f "$RUNNER_TEMP/release.jks"
+
+      - name: Show APK signer
+        run: |
+          AS=$(ls $ANDROID_SDK_ROOT/build-tools/*/apksigner 2>/dev/null | tail -1)
+          [ -n "$AS" ] && "$AS" verify --print-certs build/app/outputs/flutter-apk/app-release.apk | head -5 || echo "apksigner not found"
 
       - name: Check merged manifest
         run: |
