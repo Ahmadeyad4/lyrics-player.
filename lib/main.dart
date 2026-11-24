@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show Directory, File, FileSystemException;
+import 'dart:io' show Directory, File, FileMode, FileSystemException, IOSink;
 import 'dart:math' show Random;
 import 'dart:typed_data';
 import 'dart:ui' show ImageFilter;
@@ -77,6 +77,35 @@ final libraryVersion = ValueNotifier<int>(0);
 /// نفس القناة اللي يستعملها MainActivity (فتح الملفات + مسح الميديا)
 const _nativeCh = MethodChannel('lyricplayer/open');
 
+/// يرتفع رقمه لما تخلّص الرئيسية من إعادة قراءة المكتبة (حتى الصفحات المفتوحة تتحدّث)
+final libraryLoaded = ValueNotifier<int>(0);
+
+/// آخر قائمة أغاني قرأها التطبيق (بعد تطبيق الأسماء المعدّلة)
+Map<int, SongModel> libraryById = {};
+
+SongModel _withMeta(SongModel s, String title, String artist) => SongModel({
+      '_id': s.id,
+      '_data': s.data,
+      '_uri': s.uri,
+      '_display_name': s.displayName,
+      '_display_name_wo_ext': p.basenameWithoutExtension(s.displayName),
+      '_size': s.size,
+      'album': s.album,
+      'artist': artist,
+      'duration': s.duration,
+      'title': title,
+    });
+
+/// يطبّق الأسماء/الفنانين اللي عدّلها المستخدم داخل التطبيق
+Future<List<SongModel>> applyMeta(List<SongModel> list) async {
+  final m = await Db.metaAll();
+  if (m.isEmpty) return list;
+  return [
+    for (final s in list)
+      m[s.id] == null ? s : _withMeta(s, m[s.id]![0], m[s.id]![1])
+  ];
+}
+
 class Db {
   static Database? _db;
 
@@ -88,6 +117,7 @@ class Db {
     'CREATE TABLE IF NOT EXISTS hidden(song_id INTEGER PRIMARY KEY)',
     'CREATE TABLE IF NOT EXISTS playlists(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS playlist_songs(playlist_id INTEGER NOT NULL, song_id INTEGER NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY(playlist_id, song_id))',
+    'CREATE TABLE IF NOT EXISTS meta_override(song_id INTEGER PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL)',
   ];
 
   static Future<void> _create(Database d) async {
@@ -98,7 +128,7 @@ class Db {
 
   static Future<Database> get _d async => _db ??= await openDatabase(
         p.join(await getDatabasesPath(), 'lyrics.db'),
-        version: 5,
+        version: 6,
         onCreate: (d, v) => _create(d),
         onUpgrade: (d, o, n) async {
           await _create(d);
@@ -140,8 +170,40 @@ class Db {
     await d.delete('translations', where: 'song_id=?', whereArgs: [id]);
     await d.delete('favorites', where: 'song_id=?', whereArgs: [id]);
     await d.delete('playlist_songs', where: 'song_id=?', whereArgs: [id]);
+    await d.delete('meta_override', where: 'song_id=?', whereArgs: [id]);
     await d.delete('kv', where: 'k=?', whereArgs: ['off_$id']);
     await hide(id);
+  }
+
+  // ---- أسماء/فنانين معدّلين داخل التطبيق ----
+  static Future<Map<int, List<String>>> metaAll() async {
+    final r = await (await _d).query('meta_override');
+    return {
+      for (final e in r)
+        e['song_id'] as int: [e['title'] as String, e['artist'] as String]
+    };
+  }
+
+  static Future<void> setMeta(int id, String title, String artist) async {
+    await (await _d).insert(
+        'meta_override', {'song_id': id, 'title': title, 'artist': artist},
+        conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  static Future<void> clearMeta(int id) async {
+    await (await _d).delete('meta_override', where: 'song_id=?', whereArgs: [id]);
+  }
+
+  /// ضبط توقيت الكلمات لكل أغنية (محفوظ كـ off_<id>)
+  static Future<Map<int, int>> offsets() async {
+    final r = await (await _d).query('kv', where: "k LIKE 'off_%'");
+    final m = <int, int>{};
+    for (final e in r) {
+      final id = int.tryParse((e['k'] as String).substring(4));
+      final v = int.tryParse(e['v'] as String);
+      if (id != null && v != null) m[id] = v;
+    }
+    return m;
   }
 
   /// بعد نقل الملف يتغير رقم الأغنية بالمكتبة، فننقل الكلمات والترجمة والمفضلة والقوائم للرقم الجديد
@@ -151,7 +213,7 @@ class Db {
     await d.transaction((t) async {
       final wasHidden =
           (await t.query('hidden', where: 'song_id=?', whereArgs: [from])).isNotEmpty;
-      for (final tb in ['lyrics', 'translations', 'favorites', 'playlist_songs']) {
+      for (final tb in ['lyrics', 'translations', 'favorites', 'playlist_songs', 'meta_override']) {
         await t.rawUpdate('UPDATE OR REPLACE $tb SET song_id=? WHERE song_id=?', [to, from]);
       }
       final off = await t.query('kv', where: 'k=?', whereArgs: ['off_$from']);
@@ -572,6 +634,19 @@ class Ctrl {
     await _start((i - 1 + queue.length) % queue.length);
   }
 
+  /// بعد تعديل اسم/فنان أغنية: نحدّث نسختها داخل القائمة الحالية والأغنية الشغالة
+  static void refreshSongs(List<SongModel> all) {
+    final by = {for (final s in all) s.id: s};
+    queue = [for (final s in queue) by[s.id] ?? s];
+    final c = current.value;
+    if (c == null) return;
+    final n = by[c.id];
+    if (n != null &&
+        (n.title != c.title || cleanArtist(n.artist) != cleanArtist(c.artist))) {
+      current.value = n;
+    }
+  }
+
   /// يشيل أغنية انحذفت من القائمة، ويوقف التشغيل إذا هي الحالية
   static Future<void> forget(int id) async {
     queue = queue.where((e) => e.id != id).toList();
@@ -982,8 +1057,9 @@ Future<String?> pickTargetFolder(BuildContext context, String currentDir) async 
   );
 }
 
-/// ينقل ملف الأغنية لمجلد ثاني، ويحدّث مكتبة الهاتف، وينقل الكلمات للرقم الجديد
-Future<bool> moveSong(BuildContext context, SongModel s) async {
+/// ينقل ملف أغنية (أو عدة أغاني) لمجلد ثاني، ويحدّث مكتبة الهاتف، وينقل الكلمات للأرقام الجديدة
+Future<bool> moveSongs(BuildContext context, List<SongModel> list) async {
+  if (list.isEmpty) return false;
   void toast(String t) {
     if (context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
@@ -993,26 +1069,30 @@ Future<bool> moveSong(BuildContext context, SongModel s) async {
   var st = await Permission.manageExternalStorage.status;
   if (!st.isGranted) st = await Permission.manageExternalStorage.request();
   if (!st.isGranted) {
-    toast('لازم تفعّل صلاحية "الوصول لكل الملفات" للتطبيق من الإعدادات حتى يكدر ينقل الملف.');
+    toast('لازم تفعّل صلاحية "الوصول لكل الملفات" للتطبيق من الإعدادات حتى يكدر ينقل الملفات.');
     return false;
   }
   if (!context.mounted) return false;
 
-  final from = s.data;
-  final srcDir = _dirOf(s);
-  final destDir = await pickTargetFolder(context, srcDir);
-  if (destDir == null || destDir == srcDir || !context.mounted) return false;
+  final dirs = list.map(_dirOf).toSet();
+  final destDir = await pickTargetFolder(context, dirs.length == 1 ? dirs.first : '');
+  if (destDir == null || !context.mounted) return false;
+  final todo = list.where((s) => _dirOf(s) != destDir).toList();
+  if (todo.isEmpty) {
+    toast('الأغاني موجودة أصلاً بهذا المجلد');
+    return false;
+  }
 
-  final dest = '$destDir/${p.basename(from)}';
   final ok = await showDialog<bool>(
     context: context,
     builder: (ctx) => AlertDialog(
-      title: const Text('نقل الأغنية؟'),
+      title: Text(todo.length == 1 ? 'نقل الأغنية؟' : 'نقل ${todo.length} أغنية؟'),
       content: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(s.title, style: const TextStyle(fontWeight: FontWeight.bold)),
+          Text(todo.length == 1 ? todo.first.title : '${todo.length} أغنية',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           const Text('إلى:', style: TextStyle(color: muted)),
           Text(destDir,
@@ -1028,59 +1108,136 @@ Future<bool> moveSong(BuildContext context, SongModel s) async {
       ],
     ),
   );
-  if (ok != true) return false;
+  if (ok != true || !context.mounted) return false;
 
+  final nav = Navigator.of(context, rootNavigator: true);
+  showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => const PopScope(
+        canPop: false, child: Center(child: CircularProgressIndicator())),
+  );
+
+  final pairs = <MapEntry<SongModel, String>>[];
+  var skipped = 0, failed = 0;
   try {
     await Directory(destDir).create(recursive: true);
-    if (await File(dest).exists()) {
-      toast('يوجد ملف بنفس الاسم بالمجلد الوجهة');
-      return false;
-    }
-    try {
-      await File(from).rename(dest);
-    } on FileSystemException {
-      // مجلدين على وحدتين تخزين مختلفتين: ننسخ ثم نحذف الأصل
-      await File(from).copy(dest);
-      if (await File(dest).length() != await File(from).length()) {
-        await File(dest).delete();
-        throw Exception('copy mismatch');
+    for (final s in todo) {
+      final from = s.data;
+      final dest = '$destDir/${p.basename(from)}';
+      try {
+        if (await File(dest).exists()) {
+          skipped++;
+          continue;
+        }
+        try {
+          await File(from).rename(dest);
+        } on FileSystemException {
+          // مجلدين على وحدتين تخزين مختلفتين: ننسخ ثم نحذف الأصل
+          await File(from).copy(dest);
+          if (await File(dest).length() != await File(from).length()) {
+            await File(dest).delete();
+            throw Exception('copy mismatch');
+          }
+          await File(from).delete();
+        }
+        pairs.add(MapEntry(s, dest));
+      } catch (_) {
+        failed++;
       }
-      await File(from).delete();
+    }
+    for (final e in pairs) {
+      await Ctrl.forget(e.key.id);
+    }
+    if (pairs.isNotEmpty) {
+      try {
+        await _nativeCh.invokeMethod('scan', {
+          'paths': [
+            for (final e in pairs) ...[e.key.data, e.value]
+          ]
+        }).timeout(Duration(seconds: 8 + pairs.length));
+      } catch (_) {}
+      var byData = <String, int>{};
+      try {
+        final all = await OnAudioQuery().querySongs(uriType: UriType.EXTERNAL);
+        byData = {for (final x in all) x.data: x.id};
+      } catch (_) {}
+      for (final e in pairs) {
+        final nid = byData[e.value];
+        if (nid != null) {
+          await Db.moveId(e.key.id, nid);
+        } else {
+          await Db.hide(e.key.id);
+        }
+      }
+      libraryVersion.value++;
     }
   } catch (_) {
-    toast('تعذّر نقل الملف');
-    return false;
+    failed++;
+  } finally {
+    nav.pop();
   }
 
-  await Ctrl.forget(s.id);
-  int? newId;
-  try {
-    await _nativeCh
-        .invokeMethod('scan', {'paths': [from, dest]})
-        .timeout(const Duration(seconds: 8));
-    final all = await OnAudioQuery().querySongs(uriType: UriType.EXTERNAL);
-    for (final e in all) {
-      if (e.data == dest) {
-        newId = e.id;
-        break;
-      }
-    }
-  } catch (_) {}
-  if (newId != null) {
-    await Db.moveId(s.id, newId);
+  var msg = pairs.isEmpty
+      ? 'ما انتقلت أي أغنية'
+      : (pairs.length == 1
+          ? 'انتقلت الأغنية إلى ${_lastSeg(destDir)}'
+          : 'انتقلت ${pairs.length} أغنية إلى ${_lastSeg(destDir)}');
+  if (skipped > 0) msg += ' (تخطّيت $skipped لأن اسمها موجود بالمجلد)';
+  if (failed > 0) msg += ' (فشل نقل $failed)';
+  toast(msg);
+  return pairs.isNotEmpty;
+}
+
+Future<bool> moveSong(BuildContext context, SongModel s) =>
+    moveSongs(context, [s]);
+
+/// تعديل اسم الأغنية والفنان داخل التطبيق فقط (ما يغيّر الملف)
+Future<bool> editSongMeta(BuildContext context, SongModel s) async {
+  final tt = TextEditingController(text: s.title);
+  final ta = TextEditingController(text: cleanArtist(s.artist));
+  final r = await showDialog<String>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('تعديل الاسم والفنان'),
+      content: Column(mainAxisSize: MainAxisSize.min, children: [
+        TextField(
+            controller: tt,
+            autofocus: true,
+            decoration: const InputDecoration(labelText: 'اسم الأغنية')),
+        const SizedBox(height: 8),
+        TextField(
+            controller: ta,
+            decoration: const InputDecoration(labelText: 'الفنان')),
+        const SizedBox(height: 10),
+        const Text('التعديل داخل التطبيق فقط، ما يغيّر الملف على الهاتف.',
+            style: TextStyle(color: muted, fontSize: 12)),
+      ]),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+        TextButton(
+            onPressed: () => Navigator.pop(ctx, 'reset'),
+            child: const Text('رجوع للأصلي')),
+        FilledButton(
+            onPressed: () => Navigator.pop(ctx, 'save'), child: const Text('حفظ')),
+      ],
+    ),
+  );
+  if (r == null) return false;
+  if (r == 'reset') {
+    await Db.clearMeta(s.id);
   } else {
-    await Db.hide(s.id);
+    final t = tt.text.trim();
+    if (t.isEmpty) return false;
+    await Db.setMeta(s.id, t, ta.text.trim());
   }
   libraryVersion.value++;
-  toast(newId != null
-      ? 'انتقلت الأغنية إلى ${_lastSeg(destDir)}'
-      : 'انتقل الملف، وراح يظهر بالمكتبة بعد ما يتحدّث الهاتف');
   return true;
 }
 
 /// قائمة خيارات الأغنية (ضغطة مطوّلة)
 Future<void> showSongMenu(BuildContext context, SongModel s,
-    {int? playlistId, VoidCallback? onChanged}) async {
+    {int? playlistId, VoidCallback? onChanged, VoidCallback? onSelect}) async {
   final favs = await Db.favs();
   if (!context.mounted) return;
   final isFav = favs.contains(s.id);
@@ -1088,7 +1245,7 @@ Future<void> showSongMenu(BuildContext context, SongModel s,
     context: context,
     backgroundColor: surface,
     builder: (ctx) => SafeArea(
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
+      child: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
         ListTile(
           title: Text(s.title,
               maxLines: 1,
@@ -1123,6 +1280,24 @@ Future<void> showSongMenu(BuildContext context, SongModel s,
               onChanged?.call();
             },
           ),
+        if (onSelect != null)
+          ListTile(
+            leading: const Icon(Icons.checklist),
+            title: const Text('تحديد عدة أغاني'),
+            onTap: () {
+              Navigator.pop(ctx);
+              onSelect?.call();
+            },
+          ),
+        ListTile(
+          leading: const Icon(Icons.edit_note),
+          title: const Text('تعديل الاسم والفنان'),
+          onTap: () async {
+            Navigator.pop(ctx);
+            await editSongMeta(context, s);
+            onChanged?.call();
+          },
+        ),
         ListTile(
           leading: const Icon(Icons.drive_file_move_outline),
           title: const Text('نقل إلى مجلد آخر'),
@@ -1152,7 +1327,7 @@ Future<void> showSongMenu(BuildContext context, SongModel s,
             if (done) onChanged?.call();
           },
         ),
-      ]),
+      ])),
     ),
   );
 }
@@ -1356,6 +1531,9 @@ class SongTile extends StatelessWidget {
   final bool isFav;
   final VoidCallback onTap;
   final VoidCallback? onLong;
+
+  /// null = وضع عادي، true/false = وضع التحديد
+  final bool? selected;
   const SongTile({
     super.key,
     required this.song,
@@ -1363,12 +1541,15 @@ class SongTile extends StatelessWidget {
     required this.onTap,
     this.isFav = false,
     this.onLong,
+    this.selected,
   });
 
   @override
   Widget build(BuildContext context) {
     final artist = cleanArtist(song.artist);
+    final sel = selected;
     return ListTile(
+      tileColor: sel == true ? saffron.withOpacity(0.12) : null,
       title: Text(song.title, maxLines: 1, overflow: TextOverflow.ellipsis),
       subtitle: artist.isEmpty
           ? null
@@ -1377,7 +1558,10 @@ class SongTile extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(color: muted)),
       leading: Cover(song.id),
-      trailing: (hasLyrics || isFav)
+      trailing: sel != null
+          ? Icon(sel ? Icons.check_circle : Icons.radio_button_unchecked,
+              color: sel ? saffron : muted)
+          : (hasLyrics || isFav)
           ? Row(mainAxisSize: MainAxisSize.min, children: [
               if (isFav)
                 const Icon(Icons.favorite, color: Color(0xFFE5737F), size: 18),
@@ -1442,11 +1626,41 @@ class _GroupPageState extends State<GroupPage> {
   Set<int> ids = {};
   Set<int> favs = {};
   late List<SongModel> songs = widget.group.songs;
+  bool selecting = false;
+  Set<int> sel = {};
 
   @override
   void initState() {
     super.initState();
+    libraryLoaded.addListener(_onLib);
     _refresh();
+  }
+
+  @override
+  void dispose() {
+    libraryLoaded.removeListener(_onLib);
+    super.dispose();
+  }
+
+  void _onLib() => _refresh();
+
+  void _toggleSel(int id) {
+    setState(() {
+      if (!sel.remove(id)) sel.add(id);
+      if (sel.isEmpty) selecting = false;
+    });
+  }
+
+  Future<void> _moveSelected() async {
+    final list = songs.where((s) => sel.contains(s.id)).toList();
+    final ok = await moveSongs(context, list);
+    if (ok && mounted) {
+      setState(() {
+        selecting = false;
+        sel = {};
+      });
+      _refresh();
+    }
   }
 
   Future<void> _refresh() async {
@@ -1464,6 +1678,7 @@ class _GroupPageState extends State<GroupPage> {
       ];
     }
     list = list.where((s) => !hid.contains(s.id)).toList();
+    list = [for (final x in list) libraryById[x.id] ?? x];
     if (!mounted) return;
     setState(() {
       ids = r;
@@ -1483,15 +1698,47 @@ class _GroupPageState extends State<GroupPage> {
   @override
   Widget build(BuildContext context) {
     final g = widget.group;
-    return Scaffold(
+    return PopScope(
+      canPop: !selecting,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && selecting) {
+          setState(() {
+            selecting = false;
+            sel = {};
+          });
+        }
+      },
+      child: Scaffold(
       appBar: AppBar(
-        title: Text(g.title, maxLines: 1, overflow: TextOverflow.ellipsis),
-        actions: [
-          IconButton(
-              tooltip: 'تشغيل الكل',
-              onPressed: () => _play(0),
-              icon: const Icon(Icons.play_circle_fill, color: saffron)),
-        ],
+        leading: selecting
+            ? IconButton(
+                icon: const Icon(Icons.close),
+                tooltip: 'إلغاء التحديد',
+                onPressed: () => setState(() {
+                      selecting = false;
+                      sel = {};
+                    }))
+            : null,
+        title: Text(selecting ? '${sel.length} محددة' : g.title,
+            maxLines: 1, overflow: TextOverflow.ellipsis),
+        actions: selecting
+            ? [
+                IconButton(
+                    tooltip: 'تحديد الكل',
+                    icon: const Icon(Icons.select_all),
+                    onPressed: () =>
+                        setState(() => sel = {for (final s in songs) s.id})),
+                IconButton(
+                    tooltip: 'نقل إلى مجلد',
+                    icon: const Icon(Icons.drive_file_move_outline),
+                    onPressed: sel.isEmpty ? null : _moveSelected),
+              ]
+            : [
+                IconButton(
+                    tooltip: 'تشغيل الكل',
+                    onPressed: () => _play(0),
+                    icon: const Icon(Icons.play_circle_fill, color: saffron)),
+              ],
       ),
       body: songs.isEmpty
           ? const Center(
@@ -1509,12 +1756,523 @@ class _GroupPageState extends State<GroupPage> {
                 song: songs[i],
                 hasLyrics: ids.contains(songs[i].id),
                 isFav: favs.contains(songs[i].id),
-                onTap: () => _play(i),
-                onLong: () => showSongMenu(context, songs[i],
-                    playlistId: widget.playlistId, onChanged: _refresh),
+                selected: selecting ? sel.contains(songs[i].id) : null,
+                onTap: () {
+                  if (selecting) {
+                    _toggleSel(songs[i].id);
+                  } else {
+                    _play(i);
+                  }
+                },
+                onLong: () {
+                  if (selecting) {
+                    _toggleSel(songs[i].id);
+                  } else {
+                    showSongMenu(context, songs[i],
+                        playlistId: widget.playlistId,
+                        onChanged: _refresh,
+                        onSelect: () => setState(() {
+                              selecting = true;
+                              sel = {songs[i].id};
+                            }));
+                  }
+                },
               ),
             ),
       bottomNavigationBar: const MiniPlayer(),
+    ));
+  }
+}
+
+// ====================== التحديث من داخل التطبيق ======================
+
+/// عنوان المستودع (owner/repo) يدخل وقت البناء من الـ workflow
+const _ghRepo = String.fromEnvironment('GH_REPO');
+
+class UpdateInfo {
+  final String tag;
+  final int build;
+  final String url;
+  final int size;
+  final String notes;
+  const UpdateInfo(this.tag, this.build, this.url, this.size, this.notes);
+}
+
+enum UpState { idle, checking, upToDate, available, downloading, paused, ready, error }
+
+/// يفحص آخر Release بالمستودع، وينزّل الـ APK مع إيقاف مؤقت واستكمال، ويثبّته
+class UpdateService {
+  static final rev = ValueNotifier<int>(0);
+  static UpState state = UpState.idle;
+  static UpdateInfo? info;
+  static int received = 0;
+  static double speed = 0;
+  static String error = '';
+  static String installMsg = '';
+  static int current = 0;
+
+  static bool _pauseReq = false, _cancelReq = false;
+  static http.Client? _client;
+
+  static void _set(UpState s) {
+    state = s;
+    rev.value++;
+  }
+
+  static Future<void> loadCurrent() async {
+    try {
+      final v = await _nativeCh.invokeMethod('version');
+      if (v is Map) current = (v['code'] as num?)?.toInt() ?? 0;
+    } catch (_) {}
+  }
+
+  static Future<String> _dir() async {
+    final base = await _nativeCh.invokeMethod<String>('cacheDir');
+    final d = Directory('${base ?? Directory.systemTemp.path}/updates');
+    await d.create(recursive: true);
+    return d.path;
+  }
+
+  static Future<void> _cleanup({String? keep}) async {
+    try {
+      final d = Directory(await _dir());
+      await for (final f in d.list()) {
+        if (keep != null && p.basename(f.path).startsWith(keep)) continue;
+        await f.delete(recursive: true);
+      }
+    } catch (_) {}
+  }
+
+  static Future<UpdateInfo> _fetch() async {
+    if (_ghRepo.isEmpty) {
+      throw Exception('هذي النسخة ما فيها عنوان المستودع، ابنيها من GitHub Actions');
+    }
+    final r = await http.get(
+      Uri.parse('https://api.github.com/repos/$_ghRepo/releases/latest'),
+      headers: {'Accept': 'application/vnd.github+json'},
+    ).timeout(const Duration(seconds: 15));
+    if (r.statusCode == 404) {
+      throw Exception('ما لقيت إصدارات (تأكد أن المستودع عام)');
+    }
+    if (r.statusCode != 200) {
+      throw Exception('تعذّر الاتصال بالسيرفر (${r.statusCode})');
+    }
+    final j = jsonDecode(utf8.decode(r.bodyBytes)) as Map<String, dynamic>;
+    final tag = (j['tag_name'] ?? '').toString();
+    final build = int.tryParse(tag.replaceAll(RegExp(r'[^0-9]'), '')) ?? 0;
+    Map? apk;
+    for (final a in (j['assets'] as List? ?? const [])) {
+      final m = a as Map;
+      if ((m['name'] ?? '').toString().toLowerCase().endsWith('.apk')) {
+        apk = m;
+        break;
+      }
+    }
+    if (apk == null) throw Exception('ما لقيت ملف APK بهذا الإصدار');
+    return UpdateInfo(
+      tag,
+      build,
+      apk['browser_download_url'].toString(),
+      (apk['size'] as num?)?.toInt() ?? 0,
+      (j['body'] ?? '').toString().trim(),
+    );
+  }
+
+  /// فحص هادئ عند فتح التطبيق: يرجّع الإصدار الجديد أو null
+  static Future<UpdateInfo?> quietCheck() async {
+    try {
+      final last = int.tryParse(await Db.getKv('upd_last') ?? '') ?? 0;
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - last < 3600000) return null;
+      await Db.setKv('upd_last', '$now');
+      await loadCurrent();
+      final i = await _fetch();
+      return i.build > current ? i : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<void> checkNow() async {
+    if (state == UpState.checking || state == UpState.downloading) return;
+    _set(UpState.checking);
+    try {
+      await loadCurrent();
+      final i = await _fetch();
+      info = i;
+      if (i.build <= current) {
+        await _cleanup();
+        _set(UpState.upToDate);
+        return;
+      }
+      await _cleanup(keep: i.tag);
+      final dir = await _dir();
+      final done = File('$dir/${i.tag}.apk');
+      final part = File('$dir/${i.tag}.apk.part');
+      if (await done.exists() && (i.size == 0 || await done.length() == i.size)) {
+        received = i.size;
+        _set(UpState.ready);
+      } else if (await part.exists() &&
+          await part.length() > 0 &&
+          await part.length() < i.size) {
+        received = await part.length();
+        _set(UpState.paused);
+      } else {
+        received = 0;
+        _set(UpState.available);
+      }
+    } catch (e) {
+      error = e.toString().replaceFirst('Exception: ', '');
+      _set(UpState.error);
+    }
+  }
+
+  static void pause() {
+    if (state != UpState.downloading) return;
+    _pauseReq = true;
+    _client?.close();
+  }
+
+  static Future<void> cancel() async {
+    if (state == UpState.downloading) {
+      _cancelReq = true;
+      _client?.close();
+      return;
+    }
+    final i = info;
+    if (i != null) {
+      try {
+        final part = File('${await _dir()}/${i.tag}.apk.part');
+        if (await part.exists()) await part.delete();
+      } catch (_) {}
+    }
+    received = 0;
+    _set(UpState.available);
+  }
+
+  /// يبدأ التنزيل، أو يكمّله من آخر نقطة إذا كان متوقف
+  static Future<void> start() async {
+    final i = info;
+    if (i == null || state == UpState.downloading) return;
+    _pauseReq = false;
+    _cancelReq = false;
+    installMsg = '';
+    final dir = await _dir();
+    final part = File('$dir/${i.tag}.apk.part');
+    final done = File('$dir/${i.tag}.apk');
+    IOSink? sink;
+    try {
+      var have = await part.exists() ? await part.length() : 0;
+      if (i.size > 0 && have >= i.size) {
+        await part.delete();
+        have = 0;
+      }
+      received = have;
+      speed = 0;
+      _set(UpState.downloading);
+      final client = http.Client();
+      _client = client;
+      final req = http.Request('GET', Uri.parse(i.url));
+      if (have > 0) req.headers['Range'] = 'bytes=$have-';
+      final resp = await client.send(req);
+      if (resp.statusCode == 200 && have > 0) {
+        // السيرفر ما يدعم الاستكمال: نبدأ من الصفر
+        have = 0;
+        received = 0;
+      } else if (resp.statusCode != 200 && resp.statusCode != 206) {
+        throw Exception('السيرفر رفض التنزيل (${resp.statusCode})');
+      }
+      sink = part.openWrite(mode: have > 0 ? FileMode.append : FileMode.write);
+      var lastT = DateTime.now();
+      var lastB = received;
+      await for (final chunk in resp.stream) {
+        sink.add(chunk);
+        received += chunk.length;
+        final now = DateTime.now();
+        final dt = now.difference(lastT).inMilliseconds;
+        if (dt >= 300) {
+          speed = (received - lastB) * 1000 / dt;
+          lastT = now;
+          lastB = received;
+          rev.value++;
+        }
+        if (_pauseReq || _cancelReq) break;
+      }
+      await sink.flush();
+      await sink.close();
+      sink = null;
+      if (_cancelReq) {
+        if (await part.exists()) await part.delete();
+        received = 0;
+        _set(UpState.available);
+        return;
+      }
+      if (_pauseReq) {
+        _set(UpState.paused);
+        return;
+      }
+      final len = await part.length();
+      if (i.size > 0 && len != i.size) {
+        throw Exception('التنزيل ناقص، اضغط استمرار');
+      }
+      if (await done.exists()) await done.delete();
+      await part.rename(done.path);
+      received = len;
+      _set(UpState.ready);
+    } catch (e) {
+      try {
+        await sink?.flush();
+        await sink?.close();
+      } catch (_) {}
+      if (_cancelReq) {
+        try {
+          if (await part.exists()) await part.delete();
+        } catch (_) {}
+        received = 0;
+        _set(UpState.available);
+      } else if (_pauseReq) {
+        try {
+          received = await part.length();
+        } catch (_) {}
+        _set(UpState.paused);
+      } else {
+        try {
+          received = await part.length();
+        } catch (_) {}
+        error = e.toString().replaceFirst('Exception: ', '');
+        _set(UpState.error);
+      }
+    } finally {
+      _client?.close();
+      _client = null;
+    }
+  }
+
+  static Future<void> install() async {
+    final i = info;
+    if (i == null) return;
+    try {
+      final path = '${await _dir()}/${i.tag}.apk';
+      final r = await _nativeCh.invokeMethod<String>('install', {'path': path});
+      if (r == 'need_permission') {
+        installMsg =
+            'فعّل "السماح بالتثبيت من هذا المصدر" للتطبيق، وبعدها ارجع واضغط تثبيت.';
+      } else if (r == 'started') {
+        installMsg = 'بانتظار تأكيدك بنافذة النظام...';
+      } else if (r == 'missing') {
+        installMsg = 'ملف التحديث ما انلقى، نزّله من جديد.';
+      } else {
+        installMsg = r ?? '';
+      }
+    } catch (e) {
+      installMsg = e.toString();
+    }
+    rev.value++;
+  }
+
+  static void onInstallStatus(Map m) {
+    final status = (m['status'] as num?)?.toInt() ?? -1;
+    if (status == 0) return;
+    final msg = (m['message'] ?? '').toString();
+    installMsg = status == 3 ? 'تم إلغاء التثبيت.' : 'فشل التثبيت: $msg';
+    rev.value++;
+  }
+}
+
+class UpdatePage extends StatefulWidget {
+  const UpdatePage({super.key});
+  @override
+  State<UpdatePage> createState() => _UpdatePageState();
+}
+
+class _UpdatePageState extends State<UpdatePage> {
+  @override
+  void initState() {
+    super.initState();
+    UpdateService.rev.addListener(_r);
+    final s = UpdateService.state;
+    if (s == UpState.idle || s == UpState.error || s == UpState.upToDate) {
+      UpdateService.checkNow();
+    } else {
+      UpdateService.loadCurrent().then((_) => _r());
+    }
+  }
+
+  void _r() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    UpdateService.rev.removeListener(_r);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final st = UpdateService.state;
+    final i = UpdateService.info;
+    final size = i?.size ?? 0;
+    final prog = size > 0 ? (UpdateService.received / size).clamp(0.0, 1.0) : 0.0;
+    String mb(num b) => (b / 1048576).toStringAsFixed(1);
+    const pad = EdgeInsets.all(16);
+
+    final kids = <Widget>[
+      ListTile(
+        leading: const Icon(Icons.info_outline),
+        title: const Text('الإصدار الحالي'),
+        subtitle: Text(UpdateService.current > 0 ? 'v${UpdateService.current}' : '—'),
+      ),
+      const Divider(),
+    ];
+
+    switch (st) {
+      case UpState.idle:
+      case UpState.checking:
+        kids.add(const Padding(
+          padding: EdgeInsets.all(32),
+          child: Center(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 12),
+              Text('جاري البحث عن تحديث...'),
+            ]),
+          ),
+        ));
+        break;
+      case UpState.upToDate:
+        kids.addAll([
+          const SizedBox(height: 24),
+          const Icon(Icons.check_circle, color: saffron, size: 56),
+          const SizedBox(height: 12),
+          const Center(child: Text('عندك آخر إصدار')),
+          const SizedBox(height: 16),
+          Center(
+            child: OutlinedButton(
+                onPressed: UpdateService.checkNow, child: const Text('فحص مرة ثانية')),
+          ),
+        ]);
+        break;
+      case UpState.available:
+        kids.addAll([
+          ListTile(
+            leading: const Icon(Icons.system_update, color: saffron),
+            title: Text('يتوفر إصدار جديد: v${i?.build ?? ''}'),
+            subtitle: Text('الحجم ${mb(size)} ميغابايت'),
+          ),
+          if ((i?.notes ?? '').isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+              child: Text(i!.notes, style: const TextStyle(color: muted)),
+            ),
+          Padding(
+            padding: pad,
+            child: FilledButton.icon(
+              onPressed: UpdateService.start,
+              icon: const Icon(Icons.download),
+              label: const Text('تنزيل التحديث'),
+            ),
+          ),
+        ]);
+        break;
+      case UpState.downloading:
+      case UpState.paused:
+        {
+          final paused = st == UpState.paused;
+          final pct = (prog * 100).toStringAsFixed(0);
+          final speedTxt = (!paused && UpdateService.speed > 0)
+              ? '  •  ${mb(UpdateService.speed)} MB/s'
+              : '';
+          kids.addAll([
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+              child: Text(paused ? 'متوقف مؤقتاً' : 'جاري التنزيل...',
+                  style: TextStyle(
+                      color: paused ? muted : saffron, fontWeight: FontWeight.bold)),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: LinearProgressIndicator(
+                value: size > 0 ? prog : null,
+                minHeight: 8,
+                borderRadius: BorderRadius.circular(4),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Text(
+                  '$pct%  •  ${mb(UpdateService.received)} / ${mb(size)} MB$speedTxt',
+                  textDirection: TextDirection.ltr),
+            ),
+            Padding(
+              padding: pad,
+              child: Row(children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: paused ? UpdateService.start : UpdateService.pause,
+                    icon: Icon(paused ? Icons.play_arrow : Icons.pause),
+                    label: Text(paused ? 'استمرار' : 'إيقاف مؤقت'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                OutlinedButton.icon(
+                  onPressed: UpdateService.cancel,
+                  icon: const Icon(Icons.close),
+                  label: const Text('إلغاء'),
+                ),
+              ]),
+            ),
+          ]);
+        }
+        break;
+      case UpState.ready:
+        kids.addAll([
+          const ListTile(
+            leading: Icon(Icons.check_circle, color: saffron),
+            title: Text('اكتمل التنزيل'),
+          ),
+          Padding(
+            padding: pad,
+            child: FilledButton.icon(
+              onPressed: UpdateService.install,
+              icon: const Icon(Icons.system_update_alt),
+              label: const Text('تثبيت التحديث'),
+            ),
+          ),
+          const Padding(
+            padding: EdgeInsets.symmetric(horizontal: 16),
+            child: Text(
+                'النظام راح يطلب منك تأكيد التثبيت، وبعده يتسكّر التطبيق ويتحدّث.',
+                style: TextStyle(color: muted, fontSize: 12)),
+          ),
+          if (UpdateService.installMsg.isNotEmpty)
+            Padding(padding: pad, child: Text(UpdateService.installMsg)),
+        ]);
+        break;
+      case UpState.error:
+        {
+          final resumable = UpdateService.info != null && UpdateService.received > 0;
+          kids.addAll([
+            Padding(
+              padding: pad,
+              child: Text(UpdateService.error,
+                  style: const TextStyle(color: Color(0xFFE5737F))),
+            ),
+            Padding(
+              padding: pad,
+              child: FilledButton(
+                onPressed: resumable ? UpdateService.start : UpdateService.checkNow,
+                child: Text(resumable ? 'استمرار' : 'إعادة المحاولة'),
+              ),
+            ),
+          ]);
+        }
+        break;
+    }
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('تحديث التطبيق')),
+      body: ListView(children: kids),
     );
   }
 }
@@ -1542,12 +2300,37 @@ class _HomeState extends State<Home> {
   Map? _pendingOpen;
   bool _ready = false;
 
+  // وضع تحديد عدة أغاني
+  bool selecting = false;
+  Set<int> sel = {};
+
+  void _toggleSel(int id) {
+    setState(() {
+      if (!sel.remove(id)) sel.add(id);
+      if (sel.isEmpty) selecting = false;
+    });
+  }
+
+  Future<void> _moveSelected() async {
+    final list = songs.where((s) => sel.contains(s.id)).toList();
+    final ok = await moveSongs(context, list);
+    if (ok && mounted) {
+      setState(() {
+        selecting = false;
+        sel = {};
+      });
+    }
+  }
+
   @override
   void initState() {
     super.initState();
     _openCh.setMethodCallHandler(_onOpenCall);
     libraryVersion.addListener(_onLibrary);
-    _load().then((_) => _checkOpenIntent());
+    _load().then((_) async {
+      await _checkOpenIntent();
+      _quietUpdateCheck();
+    });
   }
 
   @override
@@ -1567,16 +2350,37 @@ class _HomeState extends State<Home> {
         uriType: UriType.EXTERNAL,
         ignoreCase: true,
       );
-      rawSongs = all.where((s) => (s.duration ?? 0) > 30000).toList();
+      rawSongs = await applyMeta(
+          all.where((s) => (s.duration ?? 0) > 30000).toList());
     } catch (_) {}
+    libraryById = {for (final x in rawSongs) x.id: x};
+    Ctrl.refreshSongs(rawSongs);
     await _refreshMeta();
+    libraryLoaded.value++;
   }
 
   Future<void> _onOpenCall(MethodCall call) async {
     if (call.method == 'opened' && call.arguments is Map) {
       _pendingOpen = Map.from(call.arguments as Map);
       await _handleOpen();
+    } else if (call.method == 'installStatus' && call.arguments is Map) {
+      UpdateService.onInstallStatus(Map.from(call.arguments as Map));
     }
+  }
+
+  /// فحص هادئ عن تحديث (مرة بالساعة): يظهر إشعار صغير إذا في إصدار جديد
+  Future<void> _quietUpdateCheck() async {
+    final i = await UpdateService.quietCheck();
+    if (i == null || !mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('يتوفر تحديث جديد (v${i.build})'),
+      duration: const Duration(seconds: 8),
+      action: SnackBarAction(
+        label: 'تحديث',
+        onPressed: () => Navigator.of(context)
+            .push(MaterialPageRoute(builder: (_) => const UpdatePage())),
+      ),
+    ));
   }
 
   Future<void> _checkOpenIntent() async {
@@ -1667,7 +2471,9 @@ class _HomeState extends State<Home> {
       uriType: UriType.EXTERNAL,
       ignoreCase: true,
     );
-    rawSongs = all.where((s) => (s.duration ?? 0) > 30000).toList();
+    rawSongs = await applyMeta(
+        all.where((s) => (s.duration ?? 0) > 30000).toList());
+    libraryById = {for (final x in rawSongs) x.id: x};
     final hid = await Db.hiddenIds();
     songs = rawSongs.where((s) => !hid.contains(s.id)).toList();
     sort = await Db.getKv('sort') ?? 'title';
@@ -1877,34 +2683,95 @@ class _HomeState extends State<Home> {
 
   Future<void> _export() async {
     final all = await Db.all();
-    if (all.isEmpty) {
-      _toast('ماكو كلمات محفوظة للتصدير');
-      return;
-    }
     final trs = await Db.allTr();
-    final byId = {for (final s in songs) s.id: s};
+    final favIds = await Db.favs();
+    final hid = await Db.hiddenIds();
+    final offs = await Db.offsets();
+    final meta = await Db.metaAll();
+    final pls = await Db.playlists();
+    final byId = {for (final x in rawSongs) x.id: x};
+
+    Map<String, dynamic> ref(int id) {
+      final x = byId[id];
+      return {
+        'id': id,
+        'file': x?.displayName ?? '',
+        'size': x?.size ?? 0,
+        'title': x?.title ?? '',
+        'artist': cleanArtist(x?.artist),
+      };
+    }
+
+    // الكلمات والترجمة
     final items = <Map<String, dynamic>>[];
     for (final e in all.entries) {
-      final s = byId[e.key];
+      final x = byId[e.key];
       final tr = trs[e.key];
       items.add({
-        'id': e.key,
-        'title': s?.title ?? '',
-        'artist': cleanArtist(s?.artist),
-        'album': s?.album ?? '',
-        'duration': s?.duration ?? 0,
+        ...ref(e.key),
+        'album': x?.album ?? '',
+        'duration': x?.duration ?? 0,
         'lrc': e.value,
         'tr': tr == null ? null : jsonDecode(tr),
       });
     }
-    final text = jsonEncode({'app': 'lyrics_player', 'version': 2, 'items': items});
+
+    // المفضلة والمخفي وضبط التوقيت والأسماء المعدّلة
+    final extraIds = <int>{...favIds, ...hid, ...offs.keys, ...meta.keys};
+    final extra = <Map<String, dynamic>>[];
+    for (final id in extraIds) {
+      if (!byId.containsKey(id)) continue;
+      extra.add({
+        ...ref(id),
+        if (favIds.contains(id)) 'fav': true,
+        if (hid.contains(id)) 'hidden': true,
+        if (offs.containsKey(id)) 'off': offs[id],
+        if (meta.containsKey(id))
+          'meta': {'title': meta[id]![0], 'artist': meta[id]![1]},
+      });
+    }
+
+    // قوائم التشغيل (بالترتيب)
+    final playlists = <Map<String, dynamic>>[];
+    for (final pl in pls) {
+      final ids = await Db.playlistSongIds(pl['id'] as int);
+      playlists.add({
+        'name': pl['name'],
+        'songs': [
+          for (final i in ids)
+            if (byId.containsKey(i)) ref(i)
+        ],
+      });
+    }
+
+    final settings = <String, String>{};
+    for (final k in ['sort', 'shuffle', 'repeat', 'font_scale', 'player_page']) {
+      final v = await Db.getKv(k);
+      if (v != null) settings[k] = v;
+    }
+
+    if (items.isEmpty && extra.isEmpty && playlists.isEmpty) {
+      _toast('ماكو بيانات للتصدير');
+      return;
+    }
+    final text = jsonEncode({
+      'app': 'lyrics_player',
+      'version': 3,
+      'items': items,
+      'songs': extra,
+      'playlists': playlists,
+      'settings': settings,
+    });
     try {
       final path = await FilePicker.platform.saveFile(
-        dialogTitle: 'حفظ نسخة الكلمات الاحتياطية',
-        fileName: 'lyrics_backup.json',
+        dialogTitle: 'حفظ النسخة الاحتياطية',
+        fileName: 'lyrics_player_backup.json',
         bytes: Uint8List.fromList(utf8.encode(text)),
       );
-      if (path != null) _toast('تم تصدير ${items.length} من الكلمات');
+      if (path != null) {
+        _toast(
+            'تم التصدير: ${items.length} كلمات، ${favIds.length} مفضلة، ${playlists.length} قوائم');
+      }
     } catch (_) {
       _toast('تعذّر حفظ الملف');
     }
@@ -1921,32 +2788,49 @@ class _HomeState extends State<Home> {
         return;
       }
       final data = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
-      final items = (data['items'] as List).cast<Map<String, dynamic>>();
 
       String norm(String? x) => (x ?? '').trim().toLowerCase();
+      final byFile = <String, SongModel>{};
       final byKey = <String, SongModel>{};
       final byTitle = <String, List<SongModel>>{};
-      for (final s in songs) {
-        byKey['${norm(s.title)}|${norm(cleanArtist(s.artist))}'] = s;
-        byTitle.putIfAbsent(norm(s.title), () => []).add(s);
+      for (final x in rawSongs) {
+        byFile['${x.displayName}|${x.size}'] = x;
+        byKey['${norm(x.title)}|${norm(cleanArtist(x.artist))}'] = x;
+        byTitle.putIfAbsent(norm(x.title), () => []).add(x);
       }
-      final byId = {for (final s in songs) s.id: s};
+      final byId = {for (final x in rawSongs) x.id: x};
 
-      var ok = 0, skipped = 0;
-      for (final it in items) {
-        final lrc = (it['lrc'] as String?) ?? '';
-        if (lrc.trim().isEmpty) continue;
+      // الأفضل: اسم الملف + حجمه، بعدين العنوان والفنان
+      SongModel? find(Map<String, dynamic> it) {
+        final file = it['file'];
+        final size = it['size'];
+        if (file is String && file.isNotEmpty && size is int) {
+          final f = byFile['$file|$size'];
+          if (f != null) return f;
+        }
         final title = norm(it['title'] as String?);
         final artist = norm(it['artist'] as String?);
-        SongModel? target = byKey['$title|$artist'];
-        if (target == null && title.isNotEmpty) {
+        final k = byKey['$title|$artist'];
+        if (k != null) return k;
+        if (title.isNotEmpty) {
           final c = byTitle[title];
-          if (c != null && c.length == 1) target = c.first;
+          return (c != null && c.length == 1) ? c.first : null;
         }
-        if (target == null && title.isEmpty) {
-          final id = it['id'];
-          if (id is int) target = byId[id];
-        }
+        final id = it['id'];
+        return id is int ? byId[id] : null;
+      }
+
+      List<Map<String, dynamic>> listOf(String key) => [
+            for (final x in (data[key] as List? ?? const []))
+              (x as Map).cast<String, dynamic>()
+          ];
+
+      var lyr = 0, skipped = 0, favN = 0, plN = 0;
+
+      for (final it in listOf('items')) {
+        final lrc = (it['lrc'] as String?) ?? '';
+        if (lrc.trim().isEmpty) continue;
+        final target = find(it);
         if (target == null) {
           skipped++;
           continue;
@@ -1959,10 +2843,61 @@ class _HomeState extends State<Home> {
             await Db.saveTr(target.id, list);
           }
         }
-        ok++;
+        lyr++;
       }
-      await _refreshMeta();
-      var msg = 'تم استيراد $ok من الكلمات';
+
+      for (final it in listOf('songs')) {
+        final t = find(it);
+        if (t == null) continue;
+        if (it['fav'] == true) {
+          await Db.setFav(t.id, true);
+          favN++;
+        }
+        if (it['hidden'] == true) await Db.hide(t.id);
+        final off = it['off'];
+        if (off is int) await Db.setKv('off_${t.id}', '$off');
+        final m = it['meta'];
+        if (m is Map) {
+          final mt = (m['title'] ?? '').toString().trim();
+          if (mt.isNotEmpty) {
+            await Db.setMeta(t.id, mt, (m['artist'] ?? '').toString().trim());
+          }
+        }
+      }
+
+      final existing = {
+        for (final e in await Db.playlists()) e['name'] as String: e['id'] as int
+      };
+      for (final pl in listOf('playlists')) {
+        final name = (pl['name'] ?? '').toString();
+        if (name.isEmpty) continue;
+        final pid = existing[name] ?? await Db.newPlaylist(name);
+        existing[name] = pid;
+        for (final x in (pl['songs'] as List? ?? const [])) {
+          final t = find((x as Map).cast<String, dynamic>());
+          if (t != null) await Db.addToPlaylist(pid, t.id);
+        }
+        plN++;
+      }
+
+      final st = data['settings'];
+      if (st is Map) {
+        for (final k in ['sort', 'shuffle', 'repeat', 'font_scale', 'player_page']) {
+          final v = st[k];
+          if (v is String) await Db.setKv(k, v);
+        }
+        await Ctrl.loadPrefs();
+        sort = await Db.getKv('sort') ?? sort;
+      }
+
+      libraryVersion.value++; // يعيد القراءة (الأسماء المعدّلة وغيرها)
+      final parts = <String>[];
+      if (lyr > 0) parts.add('$lyr كلمات');
+      if (favN > 0) parts.add('$favN مفضلة');
+      if (plN > 0) parts.add('$plN قوائم');
+      var msg = parts.isEmpty
+          ? 'ما لقيت شي جديد يتستورد'
+          : 'تم استيراد: ${parts.join('، ')}';
       if (skipped > 0) msg += ' (تخطّيت $skipped لأن الأغنية غير موجودة)';
       _toast(msg);
     } catch (_) {
@@ -2146,10 +3081,26 @@ class _HomeState extends State<Home> {
                   song: shown[i],
                   hasLyrics: withLyrics.contains(shown[i].id),
                   isFav: favs.contains(shown[i].id),
-                  onTap: () =>
-                      _playFrom(shown, i, name: scoped ? 'نتائج البحث' : null),
-                  onLong: () =>
-                      showSongMenu(context, shown[i], onChanged: _refreshMeta),
+                  selected: selecting ? sel.contains(shown[i].id) : null,
+                  onTap: () {
+                    if (selecting) {
+                      _toggleSel(shown[i].id);
+                    } else {
+                      _playFrom(shown, i, name: scoped ? 'نتائج البحث' : null);
+                    }
+                  },
+                  onLong: () {
+                    if (selecting) {
+                      _toggleSel(shown[i].id);
+                    } else {
+                      showSongMenu(context, shown[i],
+                          onChanged: _refreshMeta,
+                          onSelect: () => setState(() {
+                                selecting = true;
+                                sel = {shown[i].id};
+                              }));
+                    }
+                  },
                 ),
               ),
         _groupsTab(_groupBy(shown, _artistOf), Icons.person, art: true),
@@ -2164,10 +3115,41 @@ class _HomeState extends State<Home> {
 
     return DefaultTabController(
       length: 5,
-      child: Scaffold(
+      child: PopScope(
+        canPop: !selecting,
+        onPopInvokedWithResult: (didPop, _) {
+          if (!didPop && selecting) {
+            setState(() {
+              selecting = false;
+              sel = {};
+            });
+          }
+        },
+        child: Scaffold(
         appBar: AppBar(
-          title: const Text('مشغل الكلمات'),
-          actions: [
+          leading: selecting
+              ? IconButton(
+                  icon: const Icon(Icons.close),
+                  tooltip: 'إلغاء التحديد',
+                  onPressed: () => setState(() {
+                        selecting = false;
+                        sel = {};
+                      }))
+              : null,
+          title: Text(selecting ? '${sel.length} محددة' : 'مشغل الكلمات'),
+          actions: selecting
+              ? [
+                  IconButton(
+                      tooltip: 'تحديد الكل',
+                      icon: const Icon(Icons.select_all),
+                      onPressed: () =>
+                          setState(() => sel = {for (final x in shown) x.id})),
+                  IconButton(
+                      tooltip: 'نقل إلى مجلد',
+                      icon: const Icon(Icons.drive_file_move_outline),
+                      onPressed: sel.isEmpty ? null : _moveSelected),
+                ]
+              : [
             PopupMenuButton<String>(
               onSelected: (v) {
                 switch (v) {
@@ -2186,6 +3168,10 @@ class _HomeState extends State<Home> {
                   case 'import':
                     _import();
                     break;
+                  case 'update':
+                    Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const UpdatePage()));
+                    break;
                 }
               },
               itemBuilder: (c) => const [
@@ -2194,8 +3180,9 @@ class _HomeState extends State<Home> {
                 PopupMenuItem(
                     value: 'bulk', child: Text('سحب كلمات الأغاني الناقصة')),
                 PopupMenuItem(
-                    value: 'export', child: Text('تصدير الكلمات (نسخة احتياطية)')),
-                PopupMenuItem(value: 'import', child: Text('استيراد الكلمات')),
+                    value: 'export', child: Text('نسخة احتياطية كاملة (تصدير)')),
+                PopupMenuItem(value: 'import', child: Text('استيراد نسخة احتياطية')),
+                PopupMenuItem(value: 'update', child: Text('تحديث التطبيق')),
               ],
             ),
           ],
@@ -2255,6 +3242,7 @@ class _HomeState extends State<Home> {
           Expanded(child: body),
         ]),
         bottomNavigationBar: const MiniPlayer(),
+      ),
       ),
     );
   }
