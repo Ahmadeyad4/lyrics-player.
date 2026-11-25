@@ -1800,6 +1800,9 @@ class UpdateInfo {
 
 enum UpState { idle, checking, upToDate, available, downloading, paused, ready, error }
 
+/// إصدار جديد لقيناه بالفحص الهادئ (يخلّي أيقونة التحديث تظهر بالشريط العلوي)
+final pendingUpdate = ValueNotifier<UpdateInfo?>(null);
+
 /// يفحص آخر Release بالمستودع، وينزّل الـ APK مع إيقاف مؤقت واستكمال، ويثبّته
 class UpdateService {
   static final rev = ValueNotifier<int>(0);
@@ -1878,16 +1881,28 @@ class UpdateService {
     );
   }
 
-  /// فحص هادئ عند فتح التطبيق: يرجّع الإصدار الجديد أو null
+  static DateTime? _lastQuiet;
+  static String _notifiedTag = '';
+
+  /// فحص هادئ: يشتغل كل ما تفتح التطبيق أو ترجعله (بفاصل 3 دقايق).
+  /// يرجّع الإصدار الجديد مرة وحدة لكل إصدار حتى ما يزعجك بنفس الإشعار.
   static Future<UpdateInfo?> quietCheck() async {
+    if (state == UpState.downloading || state == UpState.checking) return null;
+    final now = DateTime.now();
+    final last = _lastQuiet;
+    if (last != null && now.difference(last).inMinutes < 3) return null;
     try {
-      final last = int.tryParse(await Db.getKv('upd_last') ?? '') ?? 0;
-      final now = DateTime.now().millisecondsSinceEpoch;
-      if (now - last < 3600000) return null;
-      await Db.setKv('upd_last', '$now');
       await loadCurrent();
       final i = await _fetch();
-      return i.build > current ? i : null;
+      _lastQuiet = now; // نسجّل الوقت بس إذا نجح الفحص
+      if (i.build <= current) {
+        pendingUpdate.value = null;
+        return null;
+      }
+      pendingUpdate.value = i;
+      if (_notifiedTag == i.tag) return null;
+      _notifiedTag = i.tag;
+      return i;
     } catch (_) {
       return null;
     }
@@ -1901,10 +1916,12 @@ class UpdateService {
       final i = await _fetch();
       info = i;
       if (i.build <= current) {
+        pendingUpdate.value = null;
         await _cleanup();
         _set(UpState.upToDate);
         return;
       }
+      pendingUpdate.value = i;
       await _cleanup(keep: i.tag);
       final dir = await _dir();
       final done = File('$dir/${i.tag}.apk');
@@ -2299,6 +2316,7 @@ class _HomeState extends State<Home> {
   static const _openCh = MethodChannel('lyricplayer/open');
   Map? _pendingOpen;
   bool _ready = false;
+  late final AppLifecycleListener _life;
 
   // وضع تحديد عدة أغاني
   bool selecting = false;
@@ -2327,15 +2345,15 @@ class _HomeState extends State<Home> {
     super.initState();
     _openCh.setMethodCallHandler(_onOpenCall);
     libraryVersion.addListener(_onLibrary);
-    _load().then((_) async {
-      await _checkOpenIntent();
-      _quietUpdateCheck();
-    });
+    _load().then((_) => _checkOpenIntent());
+    _life = AppLifecycleListener(onResume: _quietUpdateCheck);
+    _quietUpdateCheck();
   }
 
   @override
   void dispose() {
     libraryVersion.removeListener(_onLibrary);
+    _life.dispose();
     super.dispose();
   }
 
@@ -2374,7 +2392,7 @@ class _HomeState extends State<Home> {
     if (i == null || !mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Text('يتوفر تحديث جديد (v${i.build})'),
-      duration: const Duration(seconds: 8),
+      duration: const Duration(seconds: 12),
       action: SnackBarAction(
         label: 'تحديث',
         onPressed: () => Navigator.of(context)
@@ -3150,6 +3168,17 @@ class _HomeState extends State<Home> {
                       onPressed: sel.isEmpty ? null : _moveSelected),
                 ]
               : [
+            ValueListenableBuilder<UpdateInfo?>(
+              valueListenable: pendingUpdate,
+              builder: (_, u, __) => u == null
+                  ? const SizedBox.shrink()
+                  : IconButton(
+                      tooltip: 'يتوفر تحديث',
+                      icon: const Icon(Icons.system_update, color: saffron),
+                      onPressed: () => Navigator.of(context).push(
+                          MaterialPageRoute(builder: (_) => const UpdatePage())),
+                    ),
+            ),
             PopupMenuButton<String>(
               onSelected: (v) {
                 switch (v) {
