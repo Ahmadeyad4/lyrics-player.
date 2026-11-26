@@ -104,6 +104,16 @@ jobs:
                           result.success(cacheDir.absolutePath)
                       } else if (call.method == "install") {
                           result.success(installApk(call.argument<String>("path") ?: ""))
+                      } else if (call.method == "keepScreen") {
+                          val on = call.argument<Boolean>("on") ?: false
+                          runOnUiThread {
+                              if (on) {
+                                  window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                              } else {
+                                  window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                              }
+                          }
+                          result.success(true)
                       } else if (call.method == "scan") {
                           val list = call.argument<List<String>>("paths")
                           val paths = (list ?: emptyList()).toTypedArray()
