@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show Directory, File, FileMode, FileSystemException, IOSink;
+import 'dart:io' show Directory, File, FileMode, FileSystemException, IOSink, gzip;
 import 'dart:math' show Random;
 import 'dart:typed_data';
 import 'dart:ui' show ImageFilter;
@@ -29,6 +29,7 @@ import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import 'package:sqflite/sqflite.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 /// سطر كلمات واحد مع وقته
 class LyricLine {
@@ -2408,6 +2409,152 @@ String _fmtMs(num ms) {
   return h > 0 ? '$h:${two(m)}:${two(s)}' : '${two(m)}:${two(s)}';
 }
 
+/// ====================== تنزيل الترجمة من OpenSubtitles ======================
+
+class OsError implements Exception {
+  final String msg;
+  OsError(this.msg);
+  @override
+  String toString() => msg;
+}
+
+class OsAuthError implements Exception {}
+
+class OsResult {
+  final int fileId;
+  final String release;
+  final int downloads;
+  final String? url; // للمصدر المجاني (بدون مفتاح)
+  const OsResult(this.fileId, this.release, this.downloads, [this.url]);
+}
+
+class _NameInfo {
+  final String title;
+  final String? year;
+  final int? season, episode;
+  const _NameInfo(this.title, this.year, this.season, this.episode);
+}
+
+class OpenSubs {
+  static const _ua = 'LyricPlayer v1.0';
+  static const _host = 'api.opensubtitles.com';
+
+  static Map<String, String> _h(String key) => {
+        'Api-Key': key,
+        'User-Agent': _ua,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      };
+
+  /// يطلّع اسم الفيلم/المسلسل من اسم الملف (يشيل الجودة والسنة ورموز الإصدار)
+  static _NameInfo parseName(String path) {
+    var n = p.basenameWithoutExtension(path).replaceAll(RegExp(r'[._\-\[\]\(\)]'), ' ');
+    int? season, episode;
+    final se = RegExp(r'\bS(\d{1,2})\s?E(\d{1,3})\b', caseSensitive: false).firstMatch(n);
+    if (se != null) {
+      season = int.parse(se[1]!);
+      episode = int.parse(se[2]!);
+      n = n.substring(0, se.start);
+    }
+    String? year;
+    final ym = RegExp(r'\b(19|20)\d{2}\b').allMatches(n).toList();
+    if (ym.isNotEmpty && ym.last.start > 0) {
+      year = ym.last[0];
+      n = n.substring(0, ym.last.start);
+    }
+    final junk = RegExp(
+        r'\b(2160p|1080p|720p|480p|4k|bluray|brrip|bdrip|webrip|web dl|webdl|hdrip|dvdrip|hdtv|x264|x265|h264|h265|hevc|aac|ac3|dts)\b',
+        caseSensitive: false);
+    final jm = junk.firstMatch(n);
+    if (jm != null && jm.start > 0) n = n.substring(0, jm.start);
+    n = n.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return _NameInfo(n.isEmpty ? p.basenameWithoutExtension(path) : n, year, season, episode);
+  }
+
+  /// بحث بدون مفتاح (الواجهة القديمة المجانية، ممكن تتوقف بأي وقت)
+  static Future<List<OsResult>> searchFree(bool isAr, _NameInfo info) async {
+    final title = info.title.toLowerCase().replaceAll('/', ' ');
+    final path = '/search/'
+        '${info.episode != null ? 'episode-${info.episode}/' : ''}'
+        'query-$title/'
+        '${info.season != null ? 'season-${info.season}/' : ''}'
+        'sublanguageid-${isAr ? 'ara' : 'eng'}';
+    final r = await http.get(Uri.https('rest.opensubtitles.org', path), headers: {
+      'X-User-Agent': 'TemporaryUserAgent',
+      'User-Agent': 'TemporaryUserAgent',
+      'Accept': 'application/json',
+    }).timeout(const Duration(seconds: 20));
+    if (r.statusCode != 200) {
+      throw OsError('المصدر المجاني ما يستجيب (${r.statusCode})، ممكن يكون توقف');
+    }
+    final j = jsonDecode(utf8.decode(r.bodyBytes));
+    if (j is! List) throw OsError('رد غير متوقع من المصدر المجاني');
+    var rows = j.whereType<Map>().where((m) => (m['SubDownloadLink'] ?? '').toString().isNotEmpty).toList();
+    if (info.year != null) {
+      final same = rows.where((m) => m['MovieYear']?.toString() == info.year).toList();
+      if (same.isNotEmpty) rows = same;
+    }
+    final out = [
+      for (final m in rows)
+        OsResult(
+            0,
+            (m['MovieReleaseName'] ?? m['SubFileName'] ?? '').toString(),
+            int.tryParse('${m['SubDownloadsCnt']}') ?? 0,
+            m['SubDownloadLink'].toString())
+    ];
+    out.sort((a, b) => b.downloads.compareTo(a.downloads));
+    return out.length > 30 ? out.sublist(0, 30) : out;
+  }
+
+  static Future<List<int>> downloadFree(String url) async {
+    final r = await http.get(Uri.parse(url), headers: {
+      'X-User-Agent': 'TemporaryUserAgent',
+      'User-Agent': 'TemporaryUserAgent',
+    }).timeout(const Duration(seconds: 30));
+    if (r.statusCode != 200) throw OsError('فشل التنزيل (${r.statusCode})');
+    final b = r.bodyBytes;
+    if (b.length > 2 && b[0] == 0x1f && b[1] == 0x8b) return gzip.decode(b);
+    return b;
+  }
+
+  static Future<List<OsResult>> search(String key, Map<String, String> q) async {
+    final r = await http
+        .get(Uri.https(_host, '/api/v1/subtitles', q), headers: _h(key))
+        .timeout(const Duration(seconds: 20));
+    if (r.statusCode == 401 || r.statusCode == 403) throw OsAuthError();
+    if (r.statusCode == 429) throw OsError('طلبات كثيرة، جرّب بعد شوي');
+    if (r.statusCode != 200) throw OsError('فشل البحث (${r.statusCode})');
+    final j = jsonDecode(utf8.decode(r.bodyBytes)) as Map;
+    final out = <OsResult>[];
+    for (final d in (j['data'] as List? ?? const [])) {
+      final a = ((d as Map)['attributes'] as Map?) ?? const {};
+      final files = (a['files'] as List?) ?? const [];
+      if (files.isEmpty) continue;
+      final id = (files.first as Map)['file_id'];
+      if (id is! int) continue;
+      final fd = (a['feature_details'] as Map?) ?? const {};
+      final rel = (a['release'] ?? files.first['file_name'] ?? fd['title'] ?? '').toString();
+      out.add(OsResult(id, rel, (a['download_count'] as num?)?.toInt() ?? 0));
+    }
+    return out;
+  }
+
+  static Future<List<int>> download(String key, int fileId) async {
+    final r = await http
+        .post(Uri.https(_host, '/api/v1/download'),
+            headers: _h(key), body: jsonEncode({'file_id': fileId, 'sub_format': 'srt'}))
+        .timeout(const Duration(seconds: 20));
+    if (r.statusCode == 401 || r.statusCode == 403) throw OsAuthError();
+    if (r.statusCode == 406) throw OsError('وصلت للحد اليومي للتنزيل، جرّب باجر');
+    if (r.statusCode != 200) throw OsError('فشل التنزيل (${r.statusCode})');
+    final link = (jsonDecode(utf8.decode(r.bodyBytes)) as Map)['link'];
+    if (link is! String) throw OsError('ما وصل رابط التنزيل');
+    final f = await http.get(Uri.parse(link)).timeout(const Duration(seconds: 30));
+    if (f.statusCode != 200) throw OsError('فشل تحميل الملف (${f.statusCode})');
+    return f.bodyBytes;
+  }
+}
+
 /// قائمة الأفلام: تختار مجلد، وتطلع كل ملفات الفيديو بداخله
 class VideosPage extends StatefulWidget {
   const VideosPage({super.key});
@@ -2595,6 +2742,8 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
   double fontSize = 20;
   bool arTop = false;
   String curEn = '', curAr = '';
+  bool dlBusy = false, _sheetOpen = false;
+  String dlMsg = '';
 
   @override
   void initState() {
@@ -2722,8 +2871,185 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
     });
   }
 
+  /// يفتح المتصفح على صفحة بحث جاهزة باسم الفيلم؛ تنزّل الملف بنفسك وتختاره من زر المجلد
+  Future<void> _openSearch(bool isAr, VoidCallback refresh) async {
+    final info = OpenSubs.parseName(widget.path);
+    final t = info.title;
+    final q = Uri.encodeComponent(t);
+    final lang = isAr ? 'arabic' : 'english';
+    final sites = <String, String>{
+      'OpenSubtitles':
+          'https://www.opensubtitles.org/en/search/sublanguageid-${isAr ? 'ara' : 'eng'}/moviename-$q',
+      'Podnapisi':
+          'https://www.podnapisi.net/subtitles/search/?keywords=$q&language=${isAr ? 'ar' : 'en'}',
+      'Subdl': 'https://subdl.com/search/$q',
+      'Google (يشتغل دائماً)': 'https://www.google.com/search?q=' +
+          Uri.encodeComponent('$t ${info.year ?? ''} $lang subtitles srt'.replaceAll('  ', ' ')),
+    };
+    final url = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        backgroundColor: surface,
+        title: Text('ابحث عن "$t"', maxLines: 2, overflow: TextOverflow.ellipsis),
+        children: [
+          for (final e in sites.entries)
+            SimpleDialogOption(
+                onPressed: () => Navigator.pop(ctx, e.value),
+                child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: Text(e.key, style: const TextStyle(fontSize: 16)))),
+        ],
+      ),
+    );
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    if (url == null) return;
+    try {
+      final ok = await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+      dlMsg = ok ? 'نزّل الملف من المتصفح، وبعدها اختره من زر المجلد' : 'ما كدرت أفتح المتصفح';
+    } catch (_) {
+      dlMsg = 'ما كدرت أفتح المتصفح';
+    }
+    if (mounted) {
+      setState(() {});
+      refresh();
+    }
+  }
+
+  Future<String?> _askKey() async {
+    final ctl = TextEditingController(text: await Db.getKv('osKey') ?? '');
+    if (!mounted) return null;
+    final r = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: surface,
+        title: const Text('مفتاح OpenSubtitles'),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text(
+              'سجّل مجاناً بموقع opensubtitles.com، ومن قسم API consumers سوّي مفتاح والصقه هنا. ينحفظ بالهاتف مرة وحدة.',
+              style: TextStyle(color: muted, fontSize: 12)),
+          const SizedBox(height: 12),
+          TextField(
+              controller: ctl,
+              autofocus: true,
+              textDirection: TextDirection.ltr,
+              decoration: const InputDecoration(hintText: 'API key')),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+          TextButton(onPressed: () => Navigator.pop(ctx, ctl.text.trim()), child: const Text('حفظ')),
+        ],
+      ),
+    );
+    ctl.dispose();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    if (r == null || r.isEmpty) return null;
+    await Db.setKv('osKey', r);
+    return r;
+  }
+
+  /// يبحث بـ OpenSubtitles على اسم الفيلم، تختار نسخة، وينزّلها وينحفظ جنب الفيلم
+  Future<void> _downloadSub(bool isAr, VoidCallback refresh) async {
+    if (dlBusy) return;
+    final key = await Db.getKv('osKey') ?? '';
+    dlBusy = true;
+    dlMsg = 'جاري البحث...';
+    refresh();
+    try {
+      final info = OpenSubs.parseName(widget.path);
+      final q = <String, String>{
+        if (info.episode != null) 'episode_number': '${info.episode}',
+        'languages': isAr ? 'ar' : 'en',
+        'order_by': 'download_count',
+        'query': info.title.toLowerCase(),
+        if (info.season != null) 'season_number': '${info.season}',
+        if (info.year != null) 'year': info.year!,
+      };
+      final res = key.isEmpty ? await OpenSubs.searchFree(isAr, info) : await OpenSubs.search(key, q);
+      if (!mounted) return;
+      if (res.isEmpty) {
+        dlMsg = 'ما لكيت ترجمة باسم "${info.title}"';
+        return;
+      }
+      dlBusy = false;
+      dlMsg = '';
+      refresh();
+      final pick = await showDialog<OsResult>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: surface,
+          title: Row(children: [
+            const Expanded(child: Text('اختر النسخة')),
+            IconButton(
+                tooltip: 'مفتاح API (اختياري)',
+                icon: const Icon(Icons.key),
+                onPressed: () => _askKey()),
+          ]),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: res.length,
+              itemBuilder: (_, i) => ListTile(
+                title: Text(res[i].release,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    textDirection: TextDirection.ltr,
+                    style: const TextStyle(fontSize: 13)),
+                subtitle: Text('${res[i].downloads} تنزيل',
+                    style: const TextStyle(color: muted, fontSize: 12)),
+                onTap: () => Navigator.pop(ctx, res[i]),
+              ),
+            ),
+          ),
+        ),
+      );
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      if (pick == null || !mounted) return;
+      dlBusy = true;
+      dlMsg = 'جاري التنزيل...';
+      refresh();
+      final bytes = pick.url != null
+          ? await OpenSubs.downloadFree(pick.url!)
+          : await OpenSubs.download(key, pick.fileId);
+      final cues = parseSubs(decodeSubBytes(bytes));
+      if (cues.isEmpty) throw OsError('الملف المنزَّل ما فيه ترجمة صالحة');
+      final name = '${p.basenameWithoutExtension(widget.path)}.${isAr ? 'ar' : 'en'}.srt';
+      var saved = true;
+      try {
+        await File(p.join(File(widget.path).parent.path, name)).writeAsBytes(bytes);
+      } catch (_) {
+        saved = false;
+      }
+      if (!mounted) return;
+      setState(() {
+        if (isAr) {
+          ar = cues;
+          arName = name;
+          arDelay = 0;
+        } else {
+          en = cues;
+          enName = name;
+          enDelay = 0;
+        }
+      });
+      dlMsg = saved ? 'تم التنزيل وانحفظ جنب الفيلم' : 'تم التنزيل (بس ما كدرت أحفظه جنب الفيلم)';
+    } on OsAuthError {
+      await Db.setKv('osKey', '');
+      dlMsg = 'المفتاح غير صحيح، اضغط تنزيل مرة ثانية وادخل مفتاح جديد';
+    } catch (e) {
+      dlMsg = e is OsError ? e.msg : 'فشل، تأكد من الإنترنت';
+    } finally {
+      dlBusy = false;
+      if (mounted) {
+        setState(() {});
+        refresh();
+      }
+    }
+  }
+
   void _subSheet() {
     _hide?.cancel();
+    _sheetOpen = true;
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: surface,
@@ -2744,6 +3070,18 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
                   textDirection: TextDirection.ltr,
                   style: const TextStyle(color: muted, fontSize: 12)),
               trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                IconButton(
+                    tooltip: 'تنزيل من الإنترنت',
+                    icon: const Icon(Icons.cloud_download),
+                    onPressed: () => _downloadSub(isAr, () {
+                          if (_sheetOpen) setS(() {});
+                        })),
+                IconButton(
+                    tooltip: 'بحث بالمتصفح',
+                    icon: const Icon(Icons.travel_explore),
+                    onPressed: () => _openSearch(isAr, () {
+                          if (_sheetOpen) setS(() {});
+                        })),
                 IconButton(
                     tooltip: 'اختيار ملف',
                     icon: const Icon(Icons.folder_open),
@@ -2800,6 +3138,11 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
         return SafeArea(
           child: SingleChildScrollView(
             child: Column(mainAxisSize: MainAxisSize.min, children: [
+              if (dlBusy) const LinearProgressIndicator(minHeight: 2),
+              if (dlMsg.isNotEmpty)
+                Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+                    child: Text(dlMsg, style: const TextStyle(color: saffron))),
               slot('الترجمة الإنجليزية', enName, enDelay, false),
               const Divider(height: 1),
               slot('الترجمة العربية', arName, arDelay, true),
@@ -2831,7 +3174,10 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
           ),
         );
       }),
-    ).then((_) => _kick());
+    ).then((_) {
+      _sheetOpen = false;
+      _kick();
+    });
   }
 
   @override
