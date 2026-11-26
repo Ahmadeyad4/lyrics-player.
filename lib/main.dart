@@ -2719,13 +2719,16 @@ class _VideosPageState extends State<VideosPage> {
 /// مشغّل الفيديو: ترجمتين بنفس الوقت (إنجليزي + عربي) من ملفات SRT/VTT
 class VideoPlayerPage extends StatefulWidget {
   final String path;
-  const VideoPlayerPage({super.key, required this.path});
+  final String? uri; // لما الفيلم يجي من تطبيق ثاني وما نعرف مساره الحقيقي
+  const VideoPlayerPage({super.key, required this.path, this.uri});
   @override
   State<VideoPlayerPage> createState() => _VideoPlayerPageState();
 }
 
 class _VideoPlayerPageState extends State<VideoPlayerPage> {
-  late final VideoPlayerController c = VideoPlayerController.file(File(widget.path));
+  late final VideoPlayerController c = widget.uri != null
+      ? VideoPlayerController.contentUri(Uri.parse(widget.uri!))
+      : VideoPlayerController.file(File(widget.path));
   late final String posKey = 'vpos_${widget.path.hashCode}';
   bool ready = false;
   String? err;
@@ -2783,6 +2786,7 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
   /// يدور بنفس مجلد الفيلم على ملفات ترجمة باسمه، ويميّز العربي من الإنجليزي بالمحتوى
   Future<void> _autoSubs() async {
     try {
+      if (!p.isAbsolute(widget.path)) return;
       final base = p.basenameWithoutExtension(widget.path).toLowerCase();
       await for (final f in File(widget.path).parent.list()) {
         if (f is! File) continue;
@@ -3016,6 +3020,7 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
       final name = '${p.basenameWithoutExtension(widget.path)}.${isAr ? 'ar' : 'en'}.srt';
       var saved = true;
       try {
+        if (!p.isAbsolute(widget.path)) throw OsError('no folder');
         await File(p.join(File(widget.path).parent.path, name)).writeAsBytes(bytes);
       } catch (_) {
         saved = false;
@@ -3550,9 +3555,43 @@ class _HomeState extends State<Home> {
     });
   }
 
+  static const _videoExts = {
+    'mp4', 'mkv', 'avi', 'mov', 'webm', '3gp', 'm4v', 'ts', 'flv', 'wmv', 'mpg', 'mpeg'
+  };
+
+  bool _isVideoOpen(Map info) {
+    final mime = (info['mime'] ?? '').toString().toLowerCase();
+    if (mime.startsWith('video/') || mime == 'application/x-matroska') return true;
+    final n = (info['name'] ?? info['path'] ?? '').toString().toLowerCase();
+    return _videoExts.contains(p.extension(n).replaceFirst('.', ''));
+  }
+
+  /// فيلم انفتح من تطبيق ثاني (مدير ملفات، معرض...) بخيار "فتح بواسطة"
+  Future<void> _openVideoFromIntent(Map info) async {
+    final uri = (info['uri'] ?? '').toString();
+    String? real;
+    final path = info['path']?.toString();
+    if (path != null && path.isNotEmpty && File(path).existsSync()) real = path;
+    if (real == null && uri.startsWith('file://')) {
+      final pp = Uri.decodeComponent(uri.substring(7));
+      if (File(pp).existsSync()) real = pp;
+    }
+    if (real == null && uri.isEmpty) return;
+    final name = info['name']?.toString() ?? 'video';
+    Navigator.of(context).popUntil((r) => r.isFirst);
+    await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => VideoPlayerPage(path: real ?? name, uri: real == null ? uri : null)));
+  }
+
   Future<void> _handleOpen() async {
     final info = _pendingOpen;
-    if (info == null || !_ready || !mounted) return;
+    if (info == null || !mounted) return;
+    if (_isVideoOpen(info)) {
+      _pendingOpen = null;
+      await _openVideoFromIntent(info);
+      return;
+    }
+    if (!_ready) return;
     _pendingOpen = null;
     final song = _songForOpen(info);
     final i = songs.indexWhere((e) => e.id == song.id);
