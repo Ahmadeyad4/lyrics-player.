@@ -4,6 +4,8 @@ import 'dart:io' show Directory, File, FileMode, FileSystemException, IOSink;
 import 'dart:math' show Random;
 import 'dart:typed_data';
 import 'dart:ui' show ImageFilter;
+import 'package:video_player/video_player.dart'
+    show VideoPlayer, VideoPlayerController;
 import 'package:audio_service/audio_service.dart'
     show
         AudioProcessingState,
@@ -2135,7 +2137,8 @@ class _UpdatePageState extends State<UpdatePage> {
     final st = UpdateService.state;
     final i = UpdateService.info;
     final size = i?.size ?? 0;
-    final prog = size > 0 ? (UpdateService.received / size).clamp(0.0, 1.0) : 0.0;
+    final double prog =
+        size > 0 ? (UpdateService.received / size).clamp(0.0, 1.0).toDouble() : 0.0;
     String mb(num b) => (b / 1048576).toStringAsFixed(1);
     const pad = EdgeInsets.all(16);
 
@@ -2295,6 +2298,748 @@ class _UpdatePageState extends State<UpdatePage> {
     return Scaffold(
       appBar: AppBar(title: const Text('تحديث التطبيق')),
       body: ListView(padding: listBottomPad(context), children: kids),
+    );
+  }
+}
+
+// ====================== تشغيل الأفلام بترجمتين (إنجليزي + عربي) ======================
+
+class SubCue {
+  final int start; // بالميلي ثانية
+  final int end;
+  final String text;
+  const SubCue(this.start, this.end, this.text);
+}
+
+/// جدول ترميز Windows-1256 (العربي القديم) للبايتات 128..255
+const _cp1256 = <int>[8364, 1662, 8218, 402, 8222, 8230, 8224, 8225, 710, 8240, 1657, 8249, 338, 1670, 1688, 1672, 1711, 8216, 8217, 8220, 8221, 8226, 8211, 8212, 1705, 8482, 1681, 8250, 339, 8204, 8205, 1722, 160, 1548, 162, 163, 164, 165, 166, 167, 168, 169, 1726, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 1563, 187, 188, 189, 190, 1567, 1729, 1569, 1570, 1571, 1572, 1573, 1574, 1575, 1576, 1577, 1578, 1579, 1580, 1581, 1582, 1583, 1584, 1585, 1586, 1587, 1588, 1589, 1590, 215, 1591, 1592, 1593, 1594, 1600, 1601, 1602, 1603, 224, 1604, 226, 1605, 1606, 1607, 1608, 231, 232, 233, 234, 235, 1609, 1610, 238, 239, 1611, 1612, 1613, 1614, 244, 1615, 1616, 247, 1617, 249, 1618, 251, 252, 8206, 8207, 1746];
+
+/// يفك ترميز ملف ترجمة: UTF-8 أو UTF-16 أو Windows-1256
+String decodeSubBytes(List<int> bytes) {
+  var b = bytes;
+  if (b.length >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) {
+    b = b.sublist(3);
+  }
+  if (b.length >= 2 &&
+      ((b[0] == 0xFF && b[1] == 0xFE) || (b[0] == 0xFE && b[1] == 0xFF))) {
+    final le = b[0] == 0xFF;
+    final units = <int>[];
+    for (var i = 2; i + 1 < b.length; i += 2) {
+      units.add(le ? (b[i] | (b[i + 1] << 8)) : ((b[i] << 8) | b[i + 1]));
+    }
+    return String.fromCharCodes(units);
+  }
+  try {
+    return utf8.decode(b);
+  } on FormatException {
+    return String.fromCharCodes([for (final x in b) x < 128 ? x : _cp1256[x - 128]]);
+  }
+}
+
+/// نسبة الحروف العربية من كل الحروف (لتمييز ملف الترجمة العربي من الإنجليزي)
+double arabicRatio(String t) {
+  var ar = 0, letters = 0;
+  for (final r in t.runes) {
+    if (r >= 0x0600 && r <= 0x06FF) {
+      ar++;
+      letters++;
+    } else if ((r >= 65 && r <= 90) || (r >= 97 && r <= 122)) {
+      letters++;
+    }
+  }
+  return letters == 0 ? 0 : ar / letters;
+}
+
+/// يقرأ SRT و VTT
+List<SubCue> parseSubs(String raw) {
+  final text = raw.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+  final tr = RegExp(
+      r'(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{1,3})\s*-->\s*(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{1,3})');
+  int ms(String? h, String m, String s, String f) =>
+      (((int.tryParse(h ?? '0') ?? 0) * 60 + int.parse(m)) * 60 + int.parse(s)) * 1000 +
+      int.parse(f.padRight(3, '0'));
+  final out = <SubCue>[];
+  for (final block in text.split(RegExp(r'\n\s*\n'))) {
+    final lines = block.split('\n');
+    var i = 0;
+    while (i < lines.length && !tr.hasMatch(lines[i])) {
+      i++;
+    }
+    if (i >= lines.length) continue;
+    final m = tr.firstMatch(lines[i])!;
+    final start = ms(m[1], m[2]!, m[3]!, m[4]!);
+    final end = ms(m[5], m[6]!, m[7]!, m[8]!);
+    final body = lines
+        .sublist(i + 1)
+        .join('\n')
+        .replaceAll(RegExp(r'<[^>]+>'), '')
+        .replaceAll(RegExp(r'\{\\[^}]*\}'), '')
+        .trim();
+    if (body.isEmpty) continue;
+    out.add(SubCue(start, end, body));
+  }
+  out.sort((a, b) => a.start.compareTo(b.start));
+  return out;
+}
+
+/// نص الترجمة الظاهر بالوقت t (ميلي ثانية)
+String? cueAt(List<SubCue> cues, int t) {
+  if (cues.isEmpty) return null;
+  var lo = 0, hi = cues.length - 1, idx = -1;
+  while (lo <= hi) {
+    final mid = (lo + hi) >> 1;
+    if (cues[mid].start <= t) {
+      idx = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  for (var k = idx; k >= 0 && k > idx - 4; k--) {
+    if (cues[k].end > t) return cues[k].text;
+  }
+  return null;
+}
+
+String _fmtMs(num ms) {
+  final t = ms ~/ 1000;
+  final h = t ~/ 3600, m = (t % 3600) ~/ 60, s = t % 60;
+  String two(int x) => x.toString().padLeft(2, '0');
+  return h > 0 ? '$h:${two(m)}:${two(s)}' : '${two(m)}:${two(s)}';
+}
+
+/// قائمة الأفلام: تختار مجلد، وتطلع كل ملفات الفيديو بداخله
+class VideosPage extends StatefulWidget {
+  const VideosPage({super.key});
+  @override
+  State<VideosPage> createState() => _VideosPageState();
+}
+
+class _VideosPageState extends State<VideosPage> {
+  String? root;
+  List<File> files = [];
+  bool loading = false;
+  String q = '';
+  static const _exts = ['.mp4', '.mkv', '.avi', '.mov', '.m4v', '.webm', '.ts', '.3gp', '.wmv'];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadRoot();
+  }
+
+  Future<void> _loadRoot() async {
+    root = await Db.getKv('video_root');
+    if (root != null) {
+      await _scan();
+    } else if (mounted) {
+      setState(() {});
+    }
+  }
+
+  Future<void> _pick() async {
+    var st = await Permission.manageExternalStorage.status;
+    if (!st.isGranted) st = await Permission.manageExternalStorage.request();
+    if (!st.isGranted) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('لازم تفعّل صلاحية "الوصول لكل الملفات" للتطبيق من الإعدادات.')));
+      }
+      return;
+    }
+    final d = await FilePicker.platform.getDirectoryPath();
+    if (d == null) return;
+    await Db.setKv('video_root', d);
+    root = d;
+    await _scan();
+  }
+
+  Future<void> _walk(Directory d, List<File> out, int depth) async {
+    if (depth > 6) return;
+    try {
+      await for (final e in d.list(followLinks: false)) {
+        final name = p.basename(e.path);
+        if (name.startsWith('.')) continue;
+        if (e is Directory) {
+          if (depth == 0 && name == 'Android') continue;
+          await _walk(e, out, depth + 1);
+        } else if (e is File) {
+          final low = name.toLowerCase();
+          if (_exts.any(low.endsWith)) out.add(e);
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _scan() async {
+    final r = root;
+    if (r == null) return;
+    if (mounted) setState(() => loading = true);
+    final out = <File>[];
+    await _walk(Directory(r), out, 0);
+    out.sort((a, b) =>
+        p.basename(a.path).toLowerCase().compareTo(p.basename(b.path).toLowerCase()));
+    if (!mounted) return;
+    setState(() {
+      files = out;
+      loading = false;
+    });
+  }
+
+  String _size(File f) {
+    try {
+      final b = f.lengthSync();
+      return b >= 1073741824
+          ? '${(b / 1073741824).toStringAsFixed(1)} GB'
+          : '${(b / 1048576).toStringAsFixed(0)} MB';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final shown = q.isEmpty
+        ? files
+        : files.where((f) => p.basename(f.path).toLowerCase().contains(q)).toList();
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('الأفلام'),
+        actions: [
+          if (root != null)
+            IconButton(
+                tooltip: 'تحديث القائمة',
+                icon: const Icon(Icons.refresh),
+                onPressed: _scan),
+          IconButton(
+              tooltip: 'تغيير المجلد',
+              icon: const Icon(Icons.folder_open),
+              onPressed: _pick),
+        ],
+      ),
+      body: root == null
+          ? Center(
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                const Icon(Icons.movie_outlined, size: 64, color: muted),
+                const SizedBox(height: 12),
+                const Text('اختار المجلد اللي بيه أفلامك'),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                    onPressed: _pick,
+                    icon: const Icon(Icons.folder_open),
+                    label: const Text('اختيار مجلد الأفلام')),
+              ]),
+            )
+          : loading
+              ? const Center(child: CircularProgressIndicator())
+              : Column(children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                    child: TextField(
+                      decoration: const InputDecoration(
+                          prefixIcon: Icon(Icons.search), hintText: 'ابحث باسم الفيلم'),
+                      onChanged: (v) => setState(() => q = v.trim().toLowerCase()),
+                    ),
+                  ),
+                  Expanded(
+                    child: shown.isEmpty
+                        ? const Center(child: Text('ماكو أفلام بهذا المجلد'))
+                        : ListView.builder(
+                            padding: listBottomPad(context),
+                            itemCount: shown.length,
+                            itemBuilder: (c, i) {
+                              final f = shown[i];
+                              return ListTile(
+                                leading: const Icon(Icons.movie_outlined, color: saffron),
+                                title: Text(p.basenameWithoutExtension(f.path),
+                                    maxLines: 2, overflow: TextOverflow.ellipsis),
+                                subtitle: Text(
+                                    '${_lastSeg(f.parent.path)}  •  ${_size(f)}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(color: muted, fontSize: 12)),
+                                onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                                    builder: (_) => VideoPlayerPage(path: f.path))),
+                              );
+                            },
+                          ),
+                  ),
+                ]),
+    );
+  }
+}
+
+/// مشغّل الفيديو: ترجمتين بنفس الوقت (إنجليزي + عربي) من ملفات SRT/VTT
+class VideoPlayerPage extends StatefulWidget {
+  final String path;
+  const VideoPlayerPage({super.key, required this.path});
+  @override
+  State<VideoPlayerPage> createState() => _VideoPlayerPageState();
+}
+
+class _VideoPlayerPageState extends State<VideoPlayerPage> {
+  late final VideoPlayerController c = VideoPlayerController.file(File(widget.path));
+  late final String posKey = 'vpos_${widget.path.hashCode}';
+  bool ready = false;
+  String? err;
+  bool showCtl = true;
+  Timer? _hide, _tick, _toastT;
+  Duration pos = Duration.zero;
+  double? drag;
+  double _dtX = 0;
+  String toast = '';
+
+  List<SubCue> en = [], ar = [];
+  String enName = '', arName = '';
+  int enDelay = 0, arDelay = 0; // ميلي ثانية
+  double fontSize = 20;
+  bool arTop = false;
+  String curEn = '', curAr = '';
+
+  @override
+  void initState() {
+    super.initState();
+    Ctrl.player.pause();
+    _nativeCh.invokeMethod('keepScreen', {'on': true}).catchError((_) => null);
+    SystemChrome.setPreferredOrientations(
+        [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    _init();
+  }
+
+  Future<void> _init() async {
+    try {
+      fontSize = double.tryParse(await Db.getKv('vsize') ?? '') ?? fontSize;
+      arTop = (await Db.getKv('varTop')) == '1';
+      await c.initialize();
+      final saved = int.tryParse(await Db.getKv(posKey) ?? '') ?? 0;
+      final dur = c.value.duration.inMilliseconds;
+      if (saved > 10000 && saved < dur - 30000) {
+        await c.seekTo(Duration(milliseconds: saved));
+      }
+      await _autoSubs();
+      if (!mounted) return;
+      setState(() => ready = true);
+      await c.play();
+      _tick = Timer.periodic(const Duration(milliseconds: 150), (_) => _onTick());
+      _kick();
+    } catch (e) {
+      if (mounted) {
+        setState(() => err =
+            'تعذّر تشغيل الفيديو. ممكن الصيغة أو الصوت غير مدعوم بهذا الهاتف.\n$e');
+      }
+    }
+  }
+
+  /// يدور بنفس مجلد الفيلم على ملفات ترجمة باسمه، ويميّز العربي من الإنجليزي بالمحتوى
+  Future<void> _autoSubs() async {
+    try {
+      final base = p.basenameWithoutExtension(widget.path).toLowerCase();
+      await for (final f in File(widget.path).parent.list()) {
+        if (f is! File) continue;
+        final name = p.basename(f.path);
+        final low = name.toLowerCase();
+        if (!(low.endsWith('.srt') || low.endsWith('.vtt'))) continue;
+        if (!low.startsWith(base)) continue;
+        final text = decodeSubBytes(await f.readAsBytes());
+        final cues = parseSubs(text);
+        if (cues.isEmpty) continue;
+        if (arabicRatio(text) > 0.3) {
+          if (ar.isEmpty) {
+            ar = cues;
+            arName = name;
+          }
+        } else if (en.isEmpty) {
+          en = cues;
+          enName = name;
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _onTick() async {
+    if (!ready || !mounted) return;
+    final cur = await c.position;
+    if (cur == null || !mounted) return;
+    pos = cur;
+    final t = cur.inMilliseconds;
+    final e = cueAt(en, t - enDelay) ?? '';
+    final a = cueAt(ar, t - arDelay) ?? '';
+    if (e != curEn || a != curAr || showCtl) {
+      setState(() {
+        curEn = e;
+        curAr = a;
+      });
+    }
+  }
+
+  void _kick() {
+    _hide?.cancel();
+    if (!showCtl) setState(() => showCtl = true);
+    _hide = Timer(const Duration(seconds: 4), () {
+      if (mounted && c.value.isPlaying) setState(() => showCtl = false);
+    });
+  }
+
+  void _toastShow(String t) {
+    _toastT?.cancel();
+    setState(() => toast = t);
+    _toastT = Timer(const Duration(milliseconds: 900), () {
+      if (mounted) setState(() => toast = '');
+    });
+  }
+
+  Future<void> _seekBy(int sec) async {
+    final dur = c.value.duration;
+    var t = pos + Duration(seconds: sec);
+    if (t < Duration.zero) t = Duration.zero;
+    if (t > dur) t = dur;
+    await c.seekTo(t);
+    _toastShow(sec > 0 ? '+$sec ث' : '$sec ث');
+  }
+
+  Future<void> _pickSub(bool isAr) async {
+    final r = await FilePicker.platform.pickFiles(
+        type: FileType.custom, allowedExtensions: ['srt', 'vtt'], withData: true);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    if (r == null || r.files.isEmpty) return;
+    final f = r.files.first;
+    final bytes = f.bytes;
+    if (bytes == null) return;
+    final cues = parseSubs(decodeSubBytes(bytes));
+    if (cues.isEmpty) {
+      _toastShow('الملف ما فيه ترجمة صالحة');
+      return;
+    }
+    setState(() {
+      if (isAr) {
+        ar = cues;
+        arName = f.name;
+      } else {
+        en = cues;
+        enName = f.name;
+      }
+    });
+  }
+
+  void _subSheet() {
+    _hide?.cancel();
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: surface,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(builder: (ctx, setS) {
+        void both(VoidCallback f) {
+          setState(f);
+          setS(() {});
+        }
+
+        Widget slot(String title, String name, int delay, bool isAr) {
+          return Column(children: [
+            ListTile(
+              title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: Text(name.isEmpty ? 'ما موجودة' : name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textDirection: TextDirection.ltr,
+                  style: const TextStyle(color: muted, fontSize: 12)),
+              trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                IconButton(
+                    tooltip: 'اختيار ملف',
+                    icon: const Icon(Icons.folder_open),
+                    onPressed: () async {
+                      await _pickSub(isAr);
+                      setS(() {});
+                    }),
+                if (name.isNotEmpty)
+                  IconButton(
+                      tooltip: 'إزالة',
+                      icon: const Icon(Icons.close),
+                      onPressed: () => both(() {
+                            if (isAr) {
+                              ar = [];
+                              arName = '';
+                              curAr = '';
+                            } else {
+                              en = [];
+                              enName = '';
+                              curEn = '';
+                            }
+                          })),
+              ]),
+            ),
+            if (name.isNotEmpty)
+              Row(children: [
+                const SizedBox(width: 16),
+                const Text('التوقيت', style: TextStyle(color: muted)),
+                Expanded(
+                  child: Slider(
+                    value: (delay / 1000).clamp(-10.0, 10.0).toDouble(),
+                    min: -10,
+                    max: 10,
+                    divisions: 200,
+                    label: '${(delay / 1000).toStringAsFixed(1)} ث',
+                    onChanged: (v) => both(() {
+                      final ms = (v * 1000).round();
+                      if (isAr) {
+                        arDelay = ms;
+                      } else {
+                        enDelay = ms;
+                      }
+                    }),
+                  ),
+                ),
+                SizedBox(
+                    width: 52,
+                    child: Text('${(delay / 1000).toStringAsFixed(1)} ث',
+                        textDirection: TextDirection.ltr)),
+              ]),
+          ]);
+        }
+
+        return SafeArea(
+          child: SingleChildScrollView(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              slot('الترجمة الإنجليزية', enName, enDelay, false),
+              const Divider(height: 1),
+              slot('الترجمة العربية', arName, arDelay, true),
+              const Divider(height: 1),
+              SwitchListTile(
+                title: const Text('العربي فوق الإنجليزي'),
+                value: arTop,
+                onChanged: (v) {
+                  both(() => arTop = v);
+                  Db.setKv('varTop', v ? '1' : '0');
+                },
+              ),
+              Row(children: [
+                const SizedBox(width: 16),
+                const Text('حجم الخط', style: TextStyle(color: muted)),
+                Expanded(
+                  child: Slider(
+                    value: fontSize,
+                    min: 14,
+                    max: 36,
+                    divisions: 22,
+                    onChanged: (v) => both(() => fontSize = v),
+                    onChangeEnd: (v) => Db.setKv('vsize', '$v'),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 8),
+            ]),
+          ),
+        );
+      }),
+    ).then((_) => _kick());
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    _hide?.cancel();
+    _toastT?.cancel();
+    final dur = c.value.duration.inMilliseconds;
+    final done = dur > 0 && pos.inMilliseconds > dur - 30000;
+    if (pos.inMilliseconds > 0) Db.setKv(posKey, done ? '0' : '${pos.inMilliseconds}');
+    c.dispose();
+    _nativeCh.invokeMethod('keepScreen', {'on': false}).catchError((_) => null);
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    super.dispose();
+  }
+
+  Widget _subs() {
+    TextStyle st(Color col) => TextStyle(
+          color: col,
+          fontSize: fontSize,
+          height: 1.25,
+          fontWeight: FontWeight.w600,
+          shadows: const [
+            Shadow(blurRadius: 3, color: Colors.black),
+            Shadow(offset: Offset(1, 1), blurRadius: 2, color: Colors.black),
+          ],
+        );
+    final e = curEn.isEmpty
+        ? null
+        : Text(curEn,
+            textAlign: TextAlign.center,
+            textDirection: TextDirection.ltr,
+            style: st(Colors.white));
+    final a = curAr.isEmpty
+        ? null
+        : Text(curAr,
+            textAlign: TextAlign.center,
+            textDirection: TextDirection.rtl,
+            style: st(const Color(0xFFFFD54F)));
+    final first = arTop ? a : e;
+    final second = arTop ? e : a;
+    if (first == null && second == null) return const SizedBox.shrink();
+    return Positioned(
+      left: 24,
+      right: 24,
+      bottom: showCtl ? 96 : 28,
+      child: IgnorePointer(
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.45),
+                borderRadius: BorderRadius.circular(8)),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              if (first != null) first,
+              if (first != null && second != null) const SizedBox(height: 4),
+              if (second != null) second,
+            ]),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _controls() {
+    final dur = c.value.duration.inMilliseconds;
+    final double cur =
+        (drag ?? pos.inMilliseconds.toDouble()).clamp(0.0, dur.toDouble()).toDouble();
+    const w = TextStyle(color: Colors.white);
+    return Positioned.fill(
+      child: Container(
+        color: Colors.black38,
+        child: Column(children: [
+          SafeArea(
+            bottom: false,
+            child: Row(children: [
+              IconButton(
+                  icon: const Icon(Icons.arrow_back, color: Colors.white),
+                  onPressed: () => Navigator.pop(context)),
+              Expanded(
+                child: Text(p.basenameWithoutExtension(widget.path),
+                    maxLines: 1, overflow: TextOverflow.ellipsis, style: w),
+              ),
+              IconButton(
+                  tooltip: 'الترجمة',
+                  icon: const Icon(Icons.subtitles, color: Colors.white),
+                  onPressed: _subSheet),
+              PopupMenuButton<double>(
+                tooltip: 'السرعة',
+                icon: const Icon(Icons.speed, color: Colors.white),
+                onSelected: (v) {
+                  c.setPlaybackSpeed(v);
+                  _toastShow('${v}x');
+                },
+                itemBuilder: (_) => [
+                  for (final v in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
+                    PopupMenuItem(value: v, child: Text('${v}x')),
+                ],
+              ),
+            ]),
+          ),
+          Expanded(
+            child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              IconButton(
+                  iconSize: 40,
+                  icon: const Icon(Icons.replay_10, color: Colors.white),
+                  onPressed: () {
+                    _seekBy(-10);
+                    _kick();
+                  }),
+              const SizedBox(width: 24),
+              IconButton(
+                iconSize: 64,
+                icon: Icon(
+                    c.value.isPlaying ? Icons.pause_circle_filled : Icons.play_circle_fill,
+                    color: Colors.white),
+                onPressed: () async {
+                  if (c.value.isPlaying) {
+                    await c.pause();
+                  } else {
+                    await c.play();
+                  }
+                  if (mounted) setState(() {});
+                  _kick();
+                },
+              ),
+              const SizedBox(width: 24),
+              IconButton(
+                  iconSize: 40,
+                  icon: const Icon(Icons.forward_10, color: Colors.white),
+                  onPressed: () {
+                    _seekBy(10);
+                    _kick();
+                  }),
+            ]),
+          ),
+          SafeArea(
+            top: false,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Row(children: [
+                Text(_fmtMs(cur), style: w),
+                Expanded(
+                  child: Slider(
+                    value: cur,
+                    max: dur > 0 ? dur.toDouble() : 1.0,
+                    onChanged: (v) => setState(() => drag = v),
+                    onChangeEnd: (v) async {
+                      drag = null;
+                      await c.seekTo(Duration(milliseconds: v.toInt()));
+                      _kick();
+                    },
+                  ),
+                ),
+                Text(_fmtMs(dur), style: w),
+              ]),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final width = MediaQuery.of(context).size.width;
+    Widget body;
+    if (err != null) {
+      body = Center(
+          child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Text(err!, style: const TextStyle(color: Colors.white))));
+    } else if (!ready) {
+      body = const Center(child: CircularProgressIndicator());
+    } else {
+      body = GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {
+          if (showCtl) {
+            setState(() => showCtl = false);
+          } else {
+            _kick();
+          }
+        },
+        onDoubleTapDown: (d) => _dtX = d.localPosition.dx,
+        onDoubleTap: () => _seekBy(_dtX < width / 2 ? -10 : 10),
+        child: Stack(children: [
+          Center(
+              child: AspectRatio(
+                  aspectRatio: c.value.aspectRatio, child: VideoPlayer(c))),
+          _subs(),
+          if (toast.isNotEmpty)
+            Center(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                decoration: BoxDecoration(
+                    color: Colors.black54, borderRadius: BorderRadius.circular(8)),
+                child: Text(toast, style: const TextStyle(color: Colors.white, fontSize: 18)),
+              ),
+            ),
+          if (showCtl) _controls(),
+        ]),
+      );
+    }
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Directionality(textDirection: TextDirection.ltr, child: body),
     );
   }
 }
@@ -3175,6 +3920,12 @@ class _HomeState extends State<Home> {
                       onPressed: sel.isEmpty ? null : _moveSelected),
                 ]
               : [
+            IconButton(
+              tooltip: 'الأفلام',
+              icon: const Icon(Icons.movie_outlined),
+              onPressed: () => Navigator.of(context)
+                  .push(MaterialPageRoute(builder: (_) => const VideosPage())),
+            ),
             ValueListenableBuilder<UpdateInfo?>(
               valueListenable: pendingUpdate,
               builder: (_, u, __) => u == null
