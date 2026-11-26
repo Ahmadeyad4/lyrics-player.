@@ -1821,6 +1821,7 @@ class UpdateService {
   static String error = '';
   static String installMsg = '';
   static int current = 0;
+  static String currentName = '';
 
   static bool _pauseReq = false, _cancelReq = false;
   static http.Client? _client;
@@ -1833,7 +1834,10 @@ class UpdateService {
   static Future<void> loadCurrent() async {
     try {
       final v = await _nativeCh.invokeMethod('version');
-      if (v is Map) current = (v['code'] as num?)?.toInt() ?? 0;
+      if (v is Map) {
+        current = (v['code'] as num?)?.toInt() ?? 0;
+        currentName = (v['name'] ?? '').toString();
+      }
     } catch (_) {}
   }
 
@@ -1854,6 +1858,15 @@ class UpdateService {
     } catch (_) {}
   }
 
+  /// v1.2.9 -> 10209 (نفس معادلة البناء)، والـ tags القديمة مثل v41 تبقى 41
+  static int codeFromTag(String tag) {
+    final m = RegExp(r'(\d+)\.(\d+)\.(\d+)').firstMatch(tag);
+    if (m != null) {
+      return int.parse(m[1]!) * 10000 + int.parse(m[2]!) * 100 + int.parse(m[3]!);
+    }
+    return int.tryParse(tag.replaceAll(RegExp(r'[^0-9]'), '')) ?? 0;
+  }
+
   static Future<UpdateInfo> _fetch() async {
     if (_ghRepo.isEmpty) {
       throw Exception('هذي النسخة ما فيها عنوان المستودع، ابنيها من GitHub Actions');
@@ -1870,7 +1883,7 @@ class UpdateService {
     }
     final j = jsonDecode(utf8.decode(r.bodyBytes)) as Map<String, dynamic>;
     final tag = (j['tag_name'] ?? '').toString();
-    final build = int.tryParse(tag.replaceAll(RegExp(r'[^0-9]'), '')) ?? 0;
+    final build = codeFromTag(tag);
     Map? apk;
     for (final a in (j['assets'] as List? ?? const [])) {
       final m = a as Map;
@@ -2147,7 +2160,7 @@ class _UpdatePageState extends State<UpdatePage> {
       ListTile(
         leading: const Icon(Icons.info_outline),
         title: const Text('الإصدار الحالي'),
-        subtitle: Text(UpdateService.current > 0 ? 'v${UpdateService.current}' : '—'),
+        subtitle: Text(UpdateService.currentName.isNotEmpty ? 'v${UpdateService.currentName}' : (UpdateService.current > 0 ? 'v${UpdateService.current}' : '—')),
       ),
       const Divider(),
     ];
@@ -2183,7 +2196,7 @@ class _UpdatePageState extends State<UpdatePage> {
         kids.addAll([
           ListTile(
             leading: const Icon(Icons.system_update, color: saffron),
-            title: Text('يتوفر إصدار جديد: v${i?.build ?? ''}'),
+            title: Text('يتوفر إصدار جديد: ${i?.tag ?? ''}'),
             subtitle: Text('الحجم ${mb(size)} ميغابايت'),
           ),
           if ((i?.notes ?? '').isNotEmpty)
@@ -3492,7 +3505,7 @@ class _HomeState extends State<Home> {
     final i = await UpdateService.quietCheck();
     if (i == null || !mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text('يتوفر تحديث جديد (v${i.build})'),
+      content: Text('يتوفر تحديث جديد (${i.tag})'),
       duration: const Duration(seconds: 12),
       action: SnackBarAction(
         label: 'تحديث',
