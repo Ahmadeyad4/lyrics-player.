@@ -325,8 +325,17 @@ jobs:
             done
           done
 
+      - name: Read version from VERSION file
+        id: ver
+        run: |
+          V=$(tr -d ' \r\n' < VERSION)
+          IFS=. read MA MI PA <<< "$V"
+          echo "name=$V" >> "$GITHUB_OUTPUT"
+          echo "code=$((10#$MA * 10000 + 10#$MI * 100 + 10#$PA))" >> "$GITHUB_OUTPUT"
+          echo "version $V code $((10#$MA * 10000 + 10#$MI * 100 + 10#$PA))"
+
       - name: Build APK
-        run: flutter build apk --release --no-shrink --build-number=${{ github.run_number }} --build-name=1.0.${{ github.run_number }} --dart-define=GH_REPO=${{ github.repository }}
+        run: flutter build apk --release --no-shrink --build-number=${{ steps.ver.outputs.code }} --build-name=${{ steps.ver.outputs.name }} --dart-define=GH_REPO=${{ github.repository }}
 
       # توقيع ثابت بعد البناء: نفس المفتاح كل مرة حتى أندرويد يقبل التحديث فوق القديم
       - name: Sign APK with fixed key
@@ -371,6 +380,6 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ github.run_number }}
-          name: Lyrics Player v${{ github.run_number }}
+          tag_name: v${{ steps.ver.outputs.name }}
+          name: Lyrics Player v${{ steps.ver.outputs.name }}
           files: build/app/outputs/flutter-apk/app-release.apk
