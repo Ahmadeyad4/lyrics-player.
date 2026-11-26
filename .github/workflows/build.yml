@@ -65,7 +65,7 @@ jobs:
       - name: Android permissions, audio service and app name
         run: |
           M=android/app/src/main/AndroidManifest.xml
-          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>\n    <application|' $M
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>\n    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.WAKE_LOCK"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>\n    <application|' $M
           sed -i 's|</application>|<service android:name="com.ryanheise.audioservice.AudioService" android:foregroundServiceType="mediaPlayback" android:exported="true"><intent-filter><action android:name="android.media.browse.MediaBrowserService"/></intent-filter></service>\n        <receiver android:name="com.ryanheise.audioservice.MediaButtonReceiver" android:exported="true"><intent-filter><action android:name="android.intent.action.MEDIA_BUTTON"/></intent-filter></receiver>\n    </application>|' $M
           sed -i 's|android:label="[^"]*"|android:label="مشغل الكلمات"|' $M
           cat $M
@@ -73,7 +73,7 @@ jobs:
       - name: Open-with audio intent filter
         run: |
           M=android/app/src/main/AndroidManifest.xml
-          sed -i 's|</activity>|<intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="content"/><data android:scheme="file"/><data android:mimeType="audio/*"/><data android:mimeType="application/ogg"/></intent-filter>\n        </activity>|' $M
+          sed -i 's|</activity>|<intent-filter><action android:name="android.intent.action.VIEW"/><category android:name="android.intent.category.DEFAULT"/><category android:name="android.intent.category.BROWSABLE"/><data android:scheme="content"/><data android:scheme="file"/><data android:mimeType="audio/*"/><data android:mimeType="application/ogg"/><data android:mimeType="video/*"/><data android:mimeType="application/x-matroska"/></intent-filter>\n        </activity>|' $M
           grep -n "mimeType" $M
 
       - name: Custom MainActivity (audio service + open-with)
@@ -247,10 +247,27 @@ jobs:
                       }
                   } catch (e: Exception) {
                   }
+                  val mime: String? = try { contentResolver.getType(data) } catch (e: Exception) { null }
+                  var path: String? = null
+                  if (data.scheme == "file") {
+                      path = data.path
+                  } else {
+                      try {
+                          contentResolver.query(data, arrayOf("_data"), null, null, null)?.use { c ->
+                              if (c.moveToFirst()) {
+                                  val di = c.getColumnIndex("_data")
+                                  if (di >= 0) path = c.getString(di)
+                              }
+                          }
+                      } catch (e: Exception) {
+                      }
+                  }
                   return mapOf(
                       "uri" to data.toString(),
                       "name" to (name ?: data.lastPathSegment),
-                      "size" to size
+                      "size" to size,
+                      "mime" to mime,
+                      "path" to path
                   )
               }
           }
