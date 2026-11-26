@@ -988,6 +988,10 @@ Future<bool> deleteForever(BuildContext context, SongModel s) async {
   return true;
 }
 
+/// حشوة سفلية للقوائم حتى آخر عنصر ما يختفي تحت شريط التنقل (أزرار/إيماءات النظام)
+EdgeInsets listBottomPad(BuildContext c) =>
+    EdgeInsets.only(bottom: MediaQuery.of(c).viewPadding.bottom + 16);
+
 /// اختيار المجلد الوجهة: مجلدات موجودة بالمكتبة، أو مجلد جديد، أو أي مجلد من الهاتف
 Future<String?> pickTargetFolder(BuildContext context, String currentDir) async {
   final dirs = <String>{};
@@ -1751,6 +1755,7 @@ class _GroupPageState extends State<GroupPage> {
               ),
             )
           : ListView.builder(
+              padding: listBottomPad(context),
               itemCount: songs.length,
               itemBuilder: (c, i) => SongTile(
                 song: songs[i],
@@ -2289,7 +2294,7 @@ class _UpdatePageState extends State<UpdatePage> {
 
     return Scaffold(
       appBar: AppBar(title: const Text('تحديث التطبيق')),
-      body: ListView(children: kids),
+      body: ListView(padding: listBottomPad(context), children: kids),
     );
   }
 }
@@ -2991,7 +2996,7 @@ class _HomeState extends State<Home> {
   Widget _listsTab() {
     final byId = {for (final s in songs) s.id: s};
     final favCount = favs.where(byId.containsKey).length;
-    return ListView(children: [
+    return ListView(padding: listBottomPad(context), children: [
       ListTile(
         leading: const Icon(Icons.add_circle_outline, color: saffron),
         title: const Text('قائمة جديدة'),
@@ -3024,6 +3029,7 @@ class _HomeState extends State<Home> {
   Widget _groupsTab(List<Grp> gs, IconData icon, {bool art = false}) {
     if (gs.isEmpty) return const Center(child: Text('ماكو نتائج'));
     return ListView.builder(
+      padding: listBottomPad(context),
       itemCount: gs.length,
       itemBuilder: (c, i) {
         final g = gs[i];
@@ -3094,6 +3100,7 @@ class _HomeState extends State<Home> {
         shown.isEmpty
             ? const Center(child: Text('ماكو نتائج'))
             : ListView.builder(
+                padding: listBottomPad(context),
                 itemCount: shown.length,
                 itemBuilder: (c, i) => SongTile(
                   song: shown[i],
